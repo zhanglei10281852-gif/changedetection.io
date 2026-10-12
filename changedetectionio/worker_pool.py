@@ -348,6 +348,27 @@ def is_watch_running(watch_uuid):
         return watch_uuid in currently_processing_uuids
 
 
+def wait_for_watch_idle(watch_uuid, timeout=30.0, poll_interval=0.05):
+    """Wait until no worker is processing watch_uuid (history-clear task convergence).
+
+    Bounded so a slow/hung check can never stall a history clear forever: on
+    timeout the caller proceeds and relies on the history-epoch write guard.
+
+    Returns:
+        bool: True if the watch was idle at return, False on timeout.
+    """
+    if timeout is None or timeout <= 0:
+        return not is_watch_running(watch_uuid)
+
+    deadline = time.time() + float(timeout)
+    while True:
+        if not is_watch_running(watch_uuid):
+            return True
+        if time.time() >= deadline:
+            return not is_watch_running(watch_uuid)
+        time.sleep(poll_interval)
+
+
 def is_watch_running_by_another_worker(watch_uuid, current_worker_id):
     """Check if a specific watch is currently being processed by a different worker"""
     with _uuid_processing_lock:

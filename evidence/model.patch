@@ -1,0 +1,3259 @@
+diff --git a/changedetectionio/api/Watch.py b/changedetectionio/api/Watch.py
+index 66bcabdc..c4f274f9 100644
+--- a/changedetectionio/api/Watch.py
++++ b/changedetectionio/api/Watch.py
+@@ -303,9 +303,29 @@ class WatchHistory(Resource):
+         if not self.datastore.data['watching'].get(uuid):
+             abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+ 
+-        # Same call as the UI "Clear history" button - wipes snapshots/screenshots and
+-        # resets last_checked etc, while preserving the watch and its processor config
+-        self.datastore.clear_watch_history(uuid)
++        # Same chokepoint as every other clear entry point (UI button, bulk list
++        # action, processor switch, global clear-all job): one history boundary,
++        # same gating of in-flight checks and queued notifications.
++        result = self.datastore.clear_watch_history(uuid)
++
++        if result.get('error'):
++            # Boundary could not be made durable - nothing was deleted; the caller
++            # can safely retry.
++            return {'status': 'error', 'message': result['error']}, 500
++
++        warnings = []
++        if not result.get('converged', True):
++            warnings.append('An in-flight check did not converge before the timeout; '
++                            'its results were discarded by the history boundary.')
++        if result.get('file_errors'):
++            warnings.append('Some history files could not be deleted: {}'
++                            .format('; '.join(result['file_errors'])))
++
++        if warnings:
++            # Boundary committed and durable; only cleanup side effects had trouble.
++            return {'status': 'warning', 'epoch': result.get('epoch'),
++                    'warnings': warnings}, 200
++
+         return 'OK', 204
+ 
+ 
+diff --git a/changedetectionio/blueprint/ui/__init__.py b/changedetectionio/blueprint/ui/__init__.py
+index e3a2b020..101292a8 100644
+--- a/changedetectionio/blueprint/ui/__init__.py
++++ b/changedetectionio/blueprint/ui/__init__.py
+@@ -80,10 +80,25 @@ def _handle_operations(op, uuids, datastore, worker_pool, update_q, queuedWatchM
+         result_message = gettext("{} watches errors cleared").format(len(uuids))
+ 
+     elif (op == 'clear-history'):
++        cleared_n = 0
++        failed_n = 0
+         for uuid in uuids:
+-            if datastore.data['watching'].get(uuid):
+-                datastore.clear_watch_history(uuid)
+-        result_message = gettext("{} watches cleared/reset.").format(len(uuids))
++            if not datastore.data['watching'].get(uuid):
++                continue
++            result = datastore.clear_watch_history(uuid)
++            if result.get('ok'):
++                cleared_n += 1
++            else:
++                failed_n += 1
++                logger.error(f"Bulk clear-history failed for {uuid}: "
++                             f"{result.get('error') or result.get('file_errors')}")
++        if failed_n:
++            result_message = gettext(
++                "{} watches cleared/reset, {} failed (see logs/diagnostics)."
++            ).format(cleared_n, failed_n)
++            result_type = 'error'
++        else:
++            result_message = gettext("{} watches cleared/reset.").format(cleared_n)
+ 
+     elif (op == 'notification-default'):
+         from changedetectionio.notification import (
+@@ -182,50 +197,66 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool,
+     # Import the login decorator
+     from changedetectionio.auth_decorator import login_optionally_required
+ 
++    def _flash_clear_result(result):
++        """Surface the diagnosable per-watch clear result to the admin."""
++        if result.get('error'):
++            flash(gettext("Could not clear history: {}").format(result['error']), 'error')
++            return
++        problems = list(result.get('file_errors') or [])
++        if not result.get('converged', True):
++            problems.append(gettext('an in-flight check did not finish before the timeout; '
++                                    'its results were discarded by the history boundary'))
++        if problems:
++            flash(gettext("History cleared, but {} problem(s) occurred: {}").format(
++                len(problems), '; '.join(problems[:5])), 'notice')
++        else:
++            flash(gettext("Cleared snapshot history for watch {}").format(result.get('uuid')))
++
+     @ui_blueprint.route("/clear_history/<uuid_str:uuid>", methods=['POST'])
+     @login_optionally_required
+     def clear_watch_history(uuid):
+         try:
+-            datastore.clear_watch_history(uuid)
++            result = datastore.clear_watch_history(uuid)
+         except KeyError:
+             flash(gettext('Watch not found'), 'error')
+         else:
+-            flash(gettext("Cleared snapshot history for watch {}").format(uuid))
++            _flash_clear_result(result)
+         return redirect(url_for('watchlist.index'))
+ 
+     @ui_blueprint.route("/clear_history", methods=['GET', 'POST'])
+     @login_optionally_required
+     def clear_all_history():
++        job_manager = datastore.get_clear_history_job_manager()
++
+         if request.method == 'POST':
+             confirmtext = request.form.get('confirmtext', '')
+ 
+             if confirmtext.strip().lower() == gettext('clear').strip().lower():
+-                # Run in background thread to avoid blocking
+-                def clear_history_background():
+-                    # Capture UUIDs first to avoid race conditions
+-                    watch_uuids = list(datastore.data['watching'].keys())
+-                    logger.info(f"Background: Clearing history for {len(watch_uuids)} watches")
+-
+-                    for uuid in watch_uuids:
+-                        try:
+-                            datastore.clear_watch_history(uuid)
+-                        except Exception as e:
+-                            logger.error(f"Error clearing history for watch {uuid}: {e}")
+-
+-                    logger.info("Background: Completed clearing history")
+-
+-                # Start daemon thread
+-                threading.Thread(target=clear_history_background, daemon=True).start()
+-
+-                flash(gettext("History clearing started in background"))
++                # Persistent, resumable background job - survives partial failures
++                # and process restarts, and never re-clears watches that already
++                # got their boundary (so post-clear first snapshots survive).
++                action, state = job_manager.start_or_resume()
++                total = (state or {}).get('total', 0)
++                if action == 'already_running':
++                    flash(gettext("History clearing is already running in the background"), 'notice')
++                elif action == 'resumed':
++                    flash(gettext("Resumed history clearing for the remaining watches"))
++                else:
++                    flash(gettext("History clearing started in background for {} watches").format(total))
+             else:
+                 flash(gettext('Incorrect confirmation text.'), 'error')
+ 
+-            return redirect(url_for('watchlist.index'))
++            return redirect(url_for('ui.clear_all_history'))
+ 
+-        output = render_template("clear_all_history.html")
++        output = render_template("clear_all_history.html", job=job_manager.status())
+         return output
+ 
++    @ui_blueprint.route("/clear_history/status", methods=['GET'])
++    @login_optionally_required
++    def clear_all_history_status():
++        from flask import jsonify
++        return jsonify(datastore.get_clear_history_job_manager().status())
++
+     # Clear all statuses, so we do not see the 'unviewed' class
+     @ui_blueprint.route("/form/mark-all-viewed", methods=['POST'])
+     @login_optionally_required
+diff --git a/changedetectionio/blueprint/ui/edit.py b/changedetectionio/blueprint/ui/edit.py
+index 27f4ec71..ec684b07 100644
+--- a/changedetectionio/blueprint/ui/edit.py
++++ b/changedetectionio/blueprint/ui/edit.py
+@@ -95,9 +95,17 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
+             for p in processors.available_processors():
+                 if p[0] == switch_processor:
+                     datastore.data['watching'][uuid]['processor'] = switch_processor
++                    datastore.data['watching'][uuid].commit()
+                     flash(gettext("Switched to mode - {}.").format(p[1]))
+-                    datastore.clear_watch_history(uuid)
+-                    redirect(url_for('ui_edit.edit_page', uuid=uuid))
++                    # Same history-boundary semantics as every other clear entry point
++                    clear_result = datastore.clear_watch_history(uuid)
++                    if clear_result.get('error'):
++                        flash(gettext("History could not be fully cleared after switching mode: {}")
++                              .format(clear_result['error']), 'error')
++                    elif clear_result.get('file_errors') or not clear_result.get('converged', True):
++                        flash(gettext("Mode switched, but history cleanup reported problem(s); "
++                                      "it can safely be retried via Clear history."), 'notice')
++                    return redirect(url_for('ui_edit.edit_page', uuid=uuid))
+ 
+         # be sure we update with a copy instead of accidently editing the live object by reference
+         default = None
+diff --git a/changedetectionio/blueprint/ui/templates/clear_all_history.html b/changedetectionio/blueprint/ui/templates/clear_all_history.html
+index f0e07692..80ab4ca7 100644
+--- a/changedetectionio/blueprint/ui/templates/clear_all_history.html
++++ b/changedetectionio/blueprint/ui/templates/clear_all_history.html
+@@ -1,6 +1,38 @@
+ {% extends 'base.html' %} {% block content %}
+ <div class="edit-form">
+   <div class="box-wrap inner">
++    {# Persistent, resumable clear-all job state (null when it has never run) #}
++    {% if job %}
++    <div
++      id="clear-history-job-status"
++      data-status-url="{{ url_for('ui.clear_all_history_status') }}"
++      class="pure-control-group"
++      style="
++        border: 1px solid #ccc;
++        padding: 1em;
++        margin-bottom: 1em;
++        background: #fafafa;
++      "
++    >
++      <strong>{{ _('History clearing job') }}</strong>
++      <div id="clear-history-job-body">
++        <span id="clear-history-job-label">
++          {% if job.status == 'running' %}{{ _('Running') }}{% elif job.status == 'interrupted' %}{{ _('Interrupted (safe to resume)') }}{% elif job.status == 'completed_with_errors' %}{{ _('Completed with errors (safe to retry)') }}{% else %}{{ _('Completed') }}{% endif %}
++        </span>
++        <div id="clear-history-job-progress">
++          {{ job.cleared }} / {{ job.total }}
++          {% if job.gone %} ({{ job.gone }} {{ _('no longer exist') }}){% endif %}
++          {% if job.failed %} · {{ job.failed }} {{ _('failed') }}{% endif %}
++        </div>
++        <ul id="clear-history-job-errors" style="color: #b00">
++          {% for item in job['items'] if item.status == 'failed' %}
++          <li>{{ item.uuid }}: {{ item.error }}</li>
++          {% endfor %}
++        </ul>
++      </div>
++    </div>
++    {% endif %}
++
+     <form
+       class="pure-form pure-form-stacked"
+       action="{{url_for('ui.clear_all_history')}}"
+@@ -46,4 +78,53 @@
+   </div>
+ </div>
+ 
+-{% endblock %}
++{% if job %}
++<script>
++  (function () {
++    var box = document.getElementById('clear-history-job-status');
++    if (!box) return;
++    var url = box.getAttribute('data-status-url');
++
++    function render(state) {
++      if (!state) return;
++      var labelMap = {
++        running: {{ _('Running') | tojson }},
++        interrupted: {{ _('Interrupted (safe to resume)') | tojson }},
++        completed: {{ _('Completed') | tojson }},
++        completed_with_errors: {{ _('Completed with errors (safe to retry)') | tojson }}
++      };
++      document.getElementById('clear-history-job-label').textContent =
++        labelMap[state.status] || state.status;
++      var progress = state.cleared + ' / ' + state.total;
++      if (state.gone) progress += ' (' + state.gone + ' ' + {{ _('no longer exist') | tojson }} + ')';
++      if (state.failed) progress += ' · ' + state.failed + ' ' + {{ _('failed') | tojson }};
++      document.getElementById('clear-history-job-progress').textContent = progress;
++      var ul = document.getElementById('clear-history-job-errors');
++      ul.innerHTML = '';
++      (state.items || []).forEach(function (item) {
++        if (item.status === 'failed') {
++          var li = document.createElement('li');
++          li.textContent = item.uuid + ': ' + (item.error || '');
++          ul.appendChild(li);
++        }
++      });
++    }
++
++    function poll() {
++      fetch(url, { headers: { 'X-Requested-With': 'fetch' } })
++        .then(function (r) { return r.json(); })
++        .then(function (state) {
++          render(state);
++          if (state && (state.status === 'running' || (state.status === 'interrupted' && state.thread_alive))) {
++            setTimeout(poll, 2000);
++          }
++        })
++        .catch(function () {});
++    }
++
++    if ({{ 'true' if job.status == 'running' else 'false' }}) {
++      setTimeout(poll, 2000);
++    }
++  })();
++</script>
++{% endif %} {% endblock %}
+diff --git a/changedetectionio/clear_history_job.py b/changedetectionio/clear_history_job.py
+new file mode 100644
+index 00000000..99212de2
+--- /dev/null
++++ b/changedetectionio/clear_history_job.py
+@@ -0,0 +1,299 @@
++#!/usr/bin/env python3
++
++"""
++Persistent, resumable "clear history for ALL watches" background job.
++
++Why this exists
++---------------
++The old implementation spawned a fire-and-forget daemon thread over an
++in-memory snapshot of watch UUIDs. If the process exited mid-run the job was
++simply gone: some watches had a fresh history boundary, some did not, there was
++no way to tell which, and re-running cleared history (and therefore new first
++snapshots) for watches that had already been done.
++
++This manager persists job state to ``<datastore>/clear-all-history-job.json``:
++
++* The UUID set is captured once when the job is created.
++* Every watch is recorded as ``cleared`` / ``failed`` / ``gone`` and the file is
++  fsynced after each watch, so a crash leaves an exact resume marker.
++* Watches already marked ``cleared`` are NEVER touched again. A retry therefore
++  cannot delete history created after their boundary.
++* On startup a job left in ``running`` by a dead process is marked
++  ``interrupted`` and can be resumed (it is auto-resumed by the app) instead of
++  displaying "still running" forever.
++
++The per-watch work goes through the same ChangeDetectionStore.clear_watch_history()
++chokepoint as every other entry point, so the boundary semantics are identical.
++"""
++
++import json
++import os
++import tempfile
++import threading
++import time
++import uuid as uuid_builder
++
++from loguru import logger
++
++JOB_FILENAME = 'clear-all-history-job.json'
++
++STATUS_RUNNING = 'running'
++STATUS_INTERRUPTED = 'interrupted'
++STATUS_COMPLETED = 'completed'
++STATUS_COMPLETED_WITH_ERRORS = 'completed_with_errors'
++
++ITEM_PENDING = 'pending'
++ITEM_CLEARED = 'cleared'
++ITEM_FAILED = 'failed'
++ITEM_GONE = 'gone'
++
++_TERMINAL_STATUSES = (STATUS_COMPLETED, STATUS_COMPLETED_WITH_ERRORS)
++# Items that count as "done" and must never be retried
++_DONE_ITEM_STATUSES = (ITEM_CLEARED, ITEM_GONE)
++
++
++class ClearAllHistoryJobManager:
++    def __init__(self, datastore):
++        self.datastore = datastore
++        self.path = os.path.join(datastore.datastore_path, JOB_FILENAME)
++        self._lock = threading.RLock()
++        self._thread = None
++
++    # ------------------------------------------------------------------ state
++    def _load(self):
++        """Load the persisted job state, or None when absent/unreadable."""
++        if not os.path.isfile(self.path):
++            return None
++        try:
++            with open(self.path, encoding='utf-8') as f:
++                state = json.load(f)
++            # Basic shape validation - a corrupt file must not wedge clearing forever
++            if not isinstance(state, dict) or 'items' not in state:
++                raise ValueError("job state has unexpected shape")
++            return state
++        except Exception as e:
++            logger.error(f"Could not read clear-all-history job state {self.path}: {e}")
++            return None
++
++    def _save(self, state):
++        """Atomic, durable state write (temp file + fsync + replace)."""
++        os.makedirs(self.datastore.datastore_path, exist_ok=True)
++        fd, tmp_path = tempfile.mkstemp(prefix='.clear-all-history-job.', suffix='.tmp',
++                                        dir=self.datastore.datastore_path)
++        try:
++            with os.fdopen(fd, 'w', encoding='utf-8') as f:
++                json.dump(state, f, indent=2)
++                f.flush()
++                os.fsync(f.fileno())
++            os.replace(tmp_path, self.path)
++        except Exception:
++            try:
++                os.unlink(tmp_path)
++            except OSError:
++                pass
++            raise
++
++    @staticmethod
++    def _counts(state):
++        items = state.get('items', [])
++        cleared = sum(1 for i in items if i.get('status') == ITEM_CLEARED)
++        failed = sum(1 for i in items if i.get('status') == ITEM_FAILED)
++        gone = sum(1 for i in items if i.get('status') == ITEM_GONE)
++        pending = sum(1 for i in items if i.get('status') == ITEM_PENDING)
++        return {'total': len(items), 'cleared': cleared, 'failed': failed,
++                'gone': gone, 'pending': pending}
++
++    def _public_state(self, state):
++        """A snapshot safe to hand to the UI/API, with live thread info."""
++        if state is None:
++            return None
++        out = dict(state)
++        out.update(self._counts(state))
++        with self._lock:
++            out['thread_alive'] = bool(self._thread and self._thread.is_alive())
++        return out
++
++    def status(self):
++        """Current/last job state for the status page/endpoint.
++
++        Also self-heals a ``running`` file whose worker thread is dead (process
++        restart) into ``interrupted``, so the UI can never show "running" for a
++        job nobody is executing.
++        """
++        with self._lock:
++            state = self._load()
++            if state and state.get('status') == STATUS_RUNNING and not (
++                    self._thread and self._thread.is_alive()):
++                state = self._mark_interrupted(state)
++            return self._public_state(state)
++
++    def _mark_interrupted(self, state):
++        if state.get('status') != STATUS_RUNNING:
++            return state
++        state['status'] = STATUS_INTERRUPTED
++        state['updated_at'] = time.time()
++        state['interrupted_note'] = 'No running worker found for this job (process restarted?)'
++        try:
++            self._save(state)
++        except Exception as e:
++            logger.error(f"Could not persist interrupted clear-all-history job state: {e}")
++        return state
++
++    def recover_interrupted(self):
++        """Flip a stale ``running`` job to ``interrupted`` after a process restart.
++
++        Returns the recovered state, or None when there was nothing to recover.
++        """
++        with self._lock:
++            state = self._load()
++            if state and state.get('status') == STATUS_RUNNING and not (
++                    self._thread and self._thread.is_alive()):
++                logger.warning("Found an interrupted 'clear all history' job from a previous process run")
++                return self._public_state(self._mark_interrupted(state))
++            return None
++
++    # ------------------------------------------------------------------- run
++    def start_or_resume(self):
++        """Start a new job, or resume an interrupted/failed/completed-with-errors one.
++
++        Returns ``(action, state)`` where action is one of:
++        ``started``, ``resumed``, ``already_running``, ``nothing_to_resume``.
++        A cleanly-completed job is treated as "start a fresh run" (an explicit
++        new user request), snapshotting the current watch list again.
++        """
++        with self._lock:
++            state = self._load()
++
++            if state and state.get('status') == STATUS_RUNNING:
++                if self._thread and self._thread.is_alive():
++                    return 'already_running', self._public_state(state)
++                state = self._mark_interrupted(state)
++
++            if state and state.get('status') in (STATUS_INTERRUPTED, STATUS_COMPLETED_WITH_ERRORS):
++                pending = [i for i in state.get('items', []) if i.get('status') == ITEM_PENDING
++                           or i.get('status') == ITEM_FAILED]
++                if pending:
++                    # Re-arm before spawning: the worker only processes 'running'.
++                    state['status'] = STATUS_RUNNING
++                    state['updated_at'] = time.time()
++                    state.pop('finished_at', None)
++                    state.pop('interrupted_note', None)
++                    self._save(state)
++                    self._spawn(state)
++                    return 'resumed', self._public_state(state)
++                # Everything was actually done (e.g. failures were for watches
++                # deleted meanwhile) - finalize and let a fresh run be created below.
++                logger.info("Clear-all-history job has nothing left to retry; finalizing")
++
++            # New job: snapshot the watch set ONCE at request time. Watches added
++            # later are not part of this run; deleted watches are handled per-item.
++            watch_uuids = list(self.datastore.data['watching'].keys())
++            state = {
++                'job_id': str(uuid_builder.uuid4()),
++                'status': STATUS_RUNNING,
++                'created_at': time.time(),
++                'updated_at': time.time(),
++                'finished_at': None,
++                'convergence_timeout': float(os.getenv('CLEAR_HISTORY_CONVERGE_TIMEOUT', '30')),
++                'items': [{'uuid': u, 'status': ITEM_PENDING, 'epoch': None, 'error': None}
++                          for u in watch_uuids],
++            }
++            self._save(state)
++            self._spawn(state)
++            return 'started', self._public_state(state)
++
++    def _spawn(self, state):
++        job_id = state['job_id']
++        self._thread = threading.Thread(
++            target=self._run, args=(job_id,), daemon=True,
++            name=f"ClearAllHistory-{job_id[:8]}"
++        )
++        self._thread.start()
++
++    def _run(self, job_id):
++        try:
++            self._run_job(job_id)
++        except Exception as e:
++            logger.exception(f"Clear-all-history job {job_id} crashed: {e}")
++            with self._lock:
++                state = self._load()
++                if state and state.get('job_id') == job_id and state.get('status') == STATUS_RUNNING:
++                    self._mark_interrupted(state)
++
++    def _run_job(self, job_id):
++        while True:
++            with self._lock:
++                state = self._load()
++                if not state or state.get('job_id') != job_id:
++                    return
++                if state.get('status') != STATUS_RUNNING:
++                    return
++                item = next((i for i in state['items']
++                             if i.get('status') in (ITEM_PENDING, ITEM_FAILED)), None)
++                if item is None:
++                    # All items resolved - finalize exactly once.
++                    counts = self._counts(state)
++                    state['status'] = (STATUS_COMPLETED_WITH_ERRORS if counts['failed']
++                                       else STATUS_COMPLETED)
++                    state['finished_at'] = time.time()
++                    state['updated_at'] = time.time()
++                    self._save(state)
++                    logger.info(
++                        f"Clear-all-history job {job_id} finished: {counts['cleared']} cleared, "
++                        f"{counts['gone']} gone, {counts['failed']} failed"
++                    )
++                    return
++
++            item_status, item_epoch, error = self._clear_one_item(job_id, state, item)
++
++            # Persist per watch BEFORE moving on - this is the resume marker.
++            with self._lock:
++                state = self._load()
++                if not state or state.get('job_id') != job_id:
++                    return
++                target = next((i for i in state['items'] if i.get('uuid') == item['uuid']), None)
++                if target is not None:
++                    # A 'cleared'/'gone' result is final; never overwrite it with
++                    # a failure from a duplicated worker pass.
++                    if target.get('status') not in _DONE_ITEM_STATUSES or item_status in _DONE_ITEM_STATUSES:
++                        target['status'] = item_status
++                        target['epoch'] = item_epoch
++                        target['error'] = error
++                        target['finished_at'] = time.time()
++                    state['updated_at'] = time.time()
++                    try:
++                        self._save(state)
++                    except Exception as e:
++                        logger.error(
++                            f"Clear-all-history job {job_id}: state persist failed for {item['uuid']}: {e}"
++                        )
++
++    def _clear_one_item(self, job_id, state, item):
++        """Run the clear for one pending/failed item.
++
++        Returns (item_status, epoch, error_message).
++        """
++        uuid = item['uuid']
++        logger.info(f"Clear-all-history job {job_id}: clearing {uuid}")
++        try:
++            watch = self.datastore.data['watching'].get(uuid)
++            if watch is None:
++                return ITEM_GONE, None, None
++
++            result = self.datastore.clear_watch_history(
++                uuid,
++                convergence_timeout=state.get('convergence_timeout'),
++            )
++            problems = []
++            if result.get('error'):
++                problems.append(result['error'])
++            if result.get('file_errors'):
++                problems.extend(result['file_errors'])
++            if not result.get('converged', True):
++                problems.append('in-flight check did not converge before timeout; epoch guard applied')
++            if problems:
++                return ITEM_FAILED, result.get('epoch'), '; '.join(str(p) for p in problems)
++            return ITEM_CLEARED, result.get('epoch'), None
++        except Exception as e:
++            logger.error(f"Clear-all-history job {job_id}: error clearing {uuid}: {e}")
++            return ITEM_FAILED, item.get('epoch'), str(e)
+diff --git a/changedetectionio/content_fetchers/base.py b/changedetectionio/content_fetchers/base.py
+index 73b69a18..c020b353 100644
+--- a/changedetectionio/content_fetchers/base.py
++++ b/changedetectionio/content_fetchers/base.py
+@@ -80,6 +80,11 @@ class Fetcher():
+     browser_connection_url = None
+     browser_steps = None
+     browser_steps_screenshot_path = None
++    # History boundary generation for fetcher-side artifact writes (step_*.jpeg/html).
++    # None = interactive/non-worker fetch, always allowed to write.
++    check_epoch = None
++    datastore_ref = None
++    check_watch_uuid = None
+     content = None
+     error = None
+     fetcher_description = "No description"
+@@ -186,6 +191,23 @@ class Fetcher():
+     def get_last_status_code(self):
+         return self.status_code
+ 
++    def check_generation_is_current(self):
++        """Whether this fetcher may still write check artifacts to disk.
++
++        False when the fetcher belongs to a worker check whose generation was
++        superseded by a history clear mid-fetch. Non-worker fetches
++        (check_epoch is None) are always current.
++        """
++        if self.check_epoch is None:
++            return True
++        ds = self.datastore_ref
++        if not ds or not self.check_watch_uuid:
++            return True
++        watch = ds.data['watching'].get(self.check_watch_uuid)
++        if watch is None:
++            return True
++        return not watch.check_result_is_stale(self.check_epoch)
++
+     @abstractmethod
+     def screenshot_step(self, step_n):
+         if self.browser_steps_screenshot_path and not os.path.isdir(self.browser_steps_screenshot_path):
+diff --git a/changedetectionio/content_fetchers/playwright.py b/changedetectionio/content_fetchers/playwright.py
+index e21df27b..a503f899 100644
+--- a/changedetectionio/content_fetchers/playwright.py
++++ b/changedetectionio/content_fetchers/playwright.py
+@@ -215,6 +215,11 @@ class fetcher(Fetcher):
+                 self.proxy['password'] = parsed.password
+ 
+     async def screenshot_step(self, step_n=''):
++        # History boundary: a check that was cleared mid-run must not leave
++        # step screenshots behind in the new history generation.
++        if not self.check_generation_is_current():
++            logger.debug(f"Skipping step screenshot for stale check generation (step {step_n})")
++            return
+         super().screenshot_step(step_n=step_n)
+         watch_uuid = getattr(self, 'watch_uuid', None)
+         screenshot = await capture_full_page_async(page=self.page, screenshot_format=self.screenshot_format, watch_uuid=watch_uuid, lock_viewport_elements=self.lock_viewport_elements)
+@@ -233,6 +238,9 @@ class fetcher(Fetcher):
+             gc.collect()
+ 
+     async def save_step_html(self, step_n):
++        if not self.check_generation_is_current():
++            logger.debug(f"Skipping step HTML save for stale check generation (step {step_n})")
++            return
+         super().save_step_html(step_n=step_n)
+         content = await self.page.content()
+ 
+diff --git a/changedetectionio/flask_app.py b/changedetectionio/flask_app.py
+index ff05f314..4b250293 100644
+--- a/changedetectionio/flask_app.py
++++ b/changedetectionio/flask_app.py
+@@ -1513,6 +1513,19 @@ def changedetection_app(config=None, datastore_o=None):
+ 
+     # Skip background threads in batch mode (just process queue and exit)
+     batch_mode = app.config.get('batch_mode', False)
++
++    # Recover an interrupted "clear all history" job (process restarted mid-run):
++    # mark it interrupted so it can never show "running" forever, and resume in the
++    # background when the full app is running. Already-cleared watches are recorded
++    # durably and never re-cleared, so post-boundary first snapshots survive. With no
++    # stale job file this is a no-op (incl. fresh test datastores).
++    try:
++        clear_job_manager = datastore.get_clear_history_job_manager()
++        if clear_job_manager.recover_interrupted() and not batch_mode:
++            logger.info("Resuming interrupted clear-all-history background job")
++            clear_job_manager.start_or_resume()
++    except Exception as e:
++        logger.warning(f"Could not recover clear-all-history job state: {e}")
+     if not batch_mode:
+         # @todo handle ctrl break
+         # Supervised: if the ticker ever returns or raises it is logged CRITICAL and
+@@ -1605,6 +1618,19 @@ def notification_runner(worker_id=0):
+                 now = datetime.now()
+                 sent_obj = None
+ 
++                # Final history-boundary check: a change notification that was
++                # already queued when an admin cleared the watch's history must
++                # not be delivered after the boundary. Untagged (manual/test)
++                # notifications and notifications for deleted watches pass.
++                _n_epoch = n_object.get('watch_history_epoch')
++                _n_watch = datastore.data['watching'].get(n_object.get('uuid')) if n_object.get('uuid') else None
++                if _n_epoch is not None and _n_watch is not None and int(_n_epoch) != _n_watch.history_epoch:
++                    logger.info(
++                        f"Notification runner dropping pre-clear notification for "
++                        f"{n_object.get('uuid')} (epoch {_n_epoch} != {_n_watch.history_epoch})"
++                    )
++                    continue
++
+                 try:
+                     from changedetectionio.notification.handler import process_notification
+ 
+diff --git a/changedetectionio/model/Watch.py b/changedetectionio/model/Watch.py
+index 4423fdc6..eebc9671 100644
+--- a/changedetectionio/model/Watch.py
++++ b/changedetectionio/model/Watch.py
+@@ -44,6 +44,14 @@ from ..html_tools import TRANSLATE_WHITESPACE_TABLE
+ FAVICON_RESAVE_THRESHOLD_SECONDS=86400
+ BROTLI_COMPRESS_SIZE_THRESHOLD = int(os.getenv('SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD', 1024*20))
+ 
++# Persisted monotonic generation counter forming the "history boundary".
++# Incremented durably by every clear_watch() call. A worker check captures the
++# epoch when it is claimed and tags all of its result write-backs with it; writes
++# carrying an epoch that no longer matches the live value belong to a pre-clear
++# generation and are discarded, so old snapshots/screenshots/fetched pages/error
++# states/change notifications can never cross the boundary.
++HISTORY_EPOCH_KEY = 'history_clear_epoch'
++
+ # Module-level favicon filename cache: data_dir → basename (or None)
+ # Keyed by data_dir so it survives Watch object recreation, deepcopy, and concurrent requests.
+ # Invalidated explicitly when the favicon is saved or the watch history is cleared.
+@@ -364,30 +372,113 @@ class model(EntityPersistenceMixin, watch_base):
+         else:
+             return f'history-{processor}.txt'
+ 
+-    def clear_watch(self):
++    @property
++    def history_epoch(self):
++        """Current history boundary generation (0 for watches never cleared)."""
++        try:
++            return int(self.get(HISTORY_EPOCH_KEY, 0))
++        except (TypeError, ValueError):
++            return 0
++
++    @staticmethod
++    def result_write_is_stale(check_epoch, current_epoch):
++        """True when a result write tagged with check_epoch predates a history boundary.
++
++        check_epoch=None means "not produced by a claimed worker check" (UI actions,
++        imports, tests, notification test sends) - such writes are always allowed.
++        """
++        if check_epoch is None:
++            return False
++        try:
++            return int(check_epoch) != int(current_epoch)
++        except (TypeError, ValueError):
++            return False
++
++    def check_result_is_stale(self, check_epoch):
++        """Whether write-backs from check_epoch belong to an older history generation."""
++        return self.result_write_is_stale(check_epoch, self.history_epoch)
++
++    def _drop_stale_check_write(self, check_epoch, what):
++        """Log helper used by the gated save_* methods; returns True when dropped."""
++        if check_epoch is None or not self.check_result_is_stale(check_epoch):
++            return False
++        logger.info(
++            f"[{self.get('uuid')}] Discarding {what} from pre-boundary check "
++            f"(check epoch {check_epoch}, current epoch {self.history_epoch})"
++        )
++        return True
++
++    def clear_watch(self, wait_for_in_flight=True, convergence_timeout=None):
++        """Establish a durable history boundary and remove all history artifacts.
++
++        Same semantics for every entry point (single UI button, list bulk action,
++        REST DELETE, processor switch, global "clear all history" job):
++
++        1. Bounded convergence with a check that is currently running ("Checking
++           now..."), so file deletion normally runs with no writer alive.
++        2. Bump history_clear_epoch and persist it BEFORE deleting anything. From
++           that instant every check claimed before this call has its write-backs
++           gated (snapshots, screenshots, fetched pages, error state, queued
++           notifications). Only checks claimed after the boundary may create the
++           new first snapshot.
++        3. Enumerate the files to delete AFTER the boundary and delete only those
++           exact paths, so files created by a genuine post-boundary first check
++           can never be removed by a retry. Processor config files are preserved;
++           the watch itself, pause and schedule settings are untouched.
++
++        Returns a diagnosable result dict and never raises for file/convergence
++        problems. A failed boundary persistence is reported as ok=False with
++        everything left in place (state retained) so the operation can be safely
++        retried without ever deleting post-boundary history.
++        """
+         import pathlib
+ 
+-        # Get list of processor config files to preserve
+         from changedetectionio.processors import find_processors
+         processor_names = [name for cls, name in find_processors()]
+         processor_config_files = {f"{name}.json" for name in processor_names}
++        # The watch entity file (watch.json) is configuration + the durable
++        # boundary epoch, never history: keep it. (The old code deleted it and
++        # relied on a follow-up commit to recreate the file; keeping it makes the
++        # boundary commit authoritative and avoids the delete/recreate race.)
++        from changedetectionio.model.persistence import _determine_entity_type
++        processor_config_files.add(f"{_determine_entity_type(self.__class__)}.json")
++
++        result = {
++            'ok': False,
++            'uuid': self.get('uuid'),
++            'epoch_before': self.history_epoch,
++            'epoch': self.history_epoch,
++            'converged': True,
++            'file_errors': [],
++            'error': None,
++        }
+ 
+-        # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
+-        # But preserve processor config files (they're configuration, not history data)
+-        # Use glob not rglob here for safety.
+-        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
+-            # Skip processor config files
+-            if item.name in processor_config_files:
+-                continue
+-            os.unlink(item)
+-
+-        _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
+-
+-        # Force the attr to recalculate
+-        bump = self.history
++        # 1) Bounded convergence with an in-flight check. The epoch guard below is
++        #    the authoritative backstop when the wait times out; convergence only
++        #    removes the tiny file-deletion race window.
++        if wait_for_in_flight:
++            try:
++                from changedetectionio import worker_pool
++                if convergence_timeout is None:
++                    convergence_timeout = float(os.getenv('CLEAR_HISTORY_CONVERGE_TIMEOUT', '30'))
++                result['converged'] = worker_pool.wait_for_watch_idle(
++                    self.get('uuid'), timeout=convergence_timeout
++                )
++                if not result['converged']:
++                    logger.warning(
++                        f"[{self.get('uuid')}] History clear: in-flight check did not converge within "
++                        f"{convergence_timeout}s - proceeding on the epoch boundary guard"
++                    )
++            except Exception as e:
++                # Worker pool unavailable (unit tests, standalone use) - the epoch
++                # guard alone keeps the boundary safe.
++                logger.debug(f"History clear: in-flight convergence check skipped: {e}")
+ 
+-        # Do this last because it will trigger a recheck due to last_checked being zero
++        # 2) Durable boundary: bump epoch + reset live check state BEFORE unlinking.
++        #    Do this last-ish relative to scheduling (last_checked=0 makes the
++        #    ticker queue a fresh, post-boundary check).
+         self.update({
++            HISTORY_EPOCH_KEY: self.history_epoch + 1,
+             'browser_steps_last_error_step': None,
+             'check_count': 0,
+             'fetch_time': 0.0,
+@@ -400,11 +491,44 @@ class model(EntityPersistenceMixin, watch_base):
+             'remote_server_reply': None,
+             'track_ldjson_price_data': None
+         })
++        result['epoch'] = self.history_epoch
++
++        try:
++            self.commit(raise_on_error=True)
++        except Exception as e:
++            # No durable boundary -> do not touch files; leave everything retryable.
++            result['error'] = f"History boundary could not be persisted for watch {self.get('uuid')}: {e}"
++            logger.error(result['error'])
++            return result
++
++        # 3) Enumerate after the boundary; delete only exact enumerated paths.
++        #    JSON data, screenshots, text snapshots, fetched HTML etc - but keep
++        #    processor config files (configuration, not history data).
++        #    glob (not rglob) confines this to the watch's own data directory.
++        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
++            if item.name in processor_config_files:
++                continue
++            try:
++                os.unlink(item)
++            except FileNotFoundError:
++                pass
++            except OSError as e:
++                msg = f"{item.name}: {e}"
++                result['file_errors'].append(msg)
++                logger.error(f"[{self.get('uuid')}] History clear could not delete {msg}")
++
++        _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
++
++        # Force the cached history index attrs to recalculate against the empty dir
++        bump = self.history
++
+         watch_check_update = signal('watch_check_update')
+         if watch_check_update:
+             watch_check_update.send(watch_uuid=self.get('uuid'))
+ 
+-        return
++        result['ok'] = not result['file_errors']
++        return result
++
+ 
+     @property
+     def is_source_type_url(self):
+@@ -706,7 +830,11 @@ class model(EntityPersistenceMixin, watch_base):
+ 
+     # Save some text file to the appropriate path and bump the history
+     # result_obj from fetch_site_status.run()
+-    def save_history_blob(self, contents, timestamp, snapshot_id):
++    def save_history_blob(self, contents, timestamp, snapshot_id, check_epoch=None):
++        # History boundary: a snapshot produced by a check claimed before the
++        # last clear must never become the new first snapshot.
++        if self._drop_stale_check_write(check_epoch, f"snapshot {snapshot_id}"):
++            return None
+ 
+         logger.trace(f"{self.get('uuid')} - Updating {self.history_index_filename} with timestamp {timestamp}")
+ 
+@@ -862,7 +990,9 @@ class model(EntityPersistenceMixin, watch_base):
+         # Also in the case that the file didnt exist
+         return True
+ 
+-    def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None) -> None:
++    def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None, check_epoch=None) -> None:
++        if self._drop_stale_check_write(check_epoch, "favicon"):
++            return None
+         from urllib.parse import urlparse
+         import base64
+         import binascii
+@@ -1086,8 +1216,10 @@ class model(EntityPersistenceMixin, watch_base):
+             logger.debug(f"LLM cached diff summary '{fname}' FOUND")
+             return f.read().strip()
+ 
+-    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = ''):
++    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = '', check_epoch=None):
+         """Persist the AI Change Summary keyed by version pair + prompt hash."""
++        if self._drop_stale_check_write(check_epoch, f"LLM summary {from_version}->{to_version}"):
++            return
+         self.ensure_data_dir_exists()
+         prompt_hash = self._llm_summary_prompt_hash(prompt)
+         fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
+@@ -1221,13 +1353,17 @@ class model(EntityPersistenceMixin, watch_base):
+         # None is set
+         return False
+ 
+-    def save_error_text(self, contents):
++    def save_error_text(self, contents, check_epoch=None):
++        if self._drop_stale_check_write(check_epoch, "error text"):
++            return
+         self.ensure_data_dir_exists()
+         target_path = os.path.join(self.data_dir, "last-error.txt")
+         with open(target_path, 'w', encoding='utf-8') as f:
+             f.write(contents)
+ 
+-    def save_xpath_data(self, data, as_error=False):
++    def save_xpath_data(self, data, as_error=False, check_epoch=None):
++        if self._drop_stale_check_write(check_epoch, "xpath data"):
++            return
+         import json
+         import zlib
+ 
+@@ -1246,7 +1382,10 @@ class model(EntityPersistenceMixin, watch_base):
+             f.close()
+ 
+     # Save as PNG, PNG is larger but better for doing visual diff in the future
+-    def save_screenshot(self, screenshot: bytes, as_error=False):
++    def save_screenshot(self, screenshot: bytes, as_error=False, check_epoch=None):
++        if self._drop_stale_check_write(
++                check_epoch, "error screenshot" if as_error else "screenshot"):
++            return
+ 
+         if as_error:
+             target_path = os.path.join(self.data_dir, "last-error-screenshot.png")
+@@ -1275,12 +1414,16 @@ class model(EntityPersistenceMixin, watch_base):
+         with open(filepath, 'rb') as f:
+             return(brotli.decompress(f.read()).decode('utf-8'))
+ 
+-    def save_last_text_fetched_before_filters(self, contents):
++    def save_last_text_fetched_before_filters(self, contents, check_epoch=None):
++        if self._drop_stale_check_write(check_epoch, "last fetched text"):
++            return
+         import brotli
+         filepath = os.path.join(self.data_dir, 'last-fetched.br')
+         _brotli_save(contents, filepath, mode=brotli.MODE_TEXT, fallback_uncompressed=False)
+ 
+-    def save_last_fetched_html(self, timestamp, contents):
++    def save_last_fetched_html(self, timestamp, contents, check_epoch=None):
++        if self._drop_stale_check_write(check_epoch, f"fetched HTML {timestamp}"):
++            return
+         self.ensure_data_dir_exists()
+         snapshot_fname = f"{timestamp}.html.br"
+         filepath = os.path.join(self.data_dir, snapshot_fname)
+diff --git a/changedetectionio/model/__init__.py b/changedetectionio/model/__init__.py
+index 2101c25d..5431d98b 100644
+--- a/changedetectionio/model/__init__.py
++++ b/changedetectionio/model/__init__.py
+@@ -642,27 +642,37 @@ class watch_base(dict):
+         """
+         raise NotImplementedError("Subclass must implement _save_to_disk()")
+ 
+-    def commit(self):
++    def commit(self, raise_on_error=False):
+         """
+         Save this watch/tag immediately to disk using atomic write.
+ 
+         Common commit logic for Watch and Tag objects.
+         Subclasses override _get_commit_data() and _save_to_disk() for specifics.
+ 
+-        Fire-and-forget: Logs errors but does not raise exceptions.
++        Fire-and-forget by default: logs errors but does not raise exceptions.
+         Data remains in memory even if save fails, so next commit will retry.
++
++        Pass raise_on_error=True when the caller must know whether the write hit
++        disk durably (e.g. the history-clear boundary commit, where deleting files
++        against an unpersisted boundary would be unsafe).
+         """
+         from loguru import logger
+ 
+         if not self.data_dir:
+             entity_type = self.__class__.__name__
+-            logger.error(f"Cannot commit {entity_type} {self.get('uuid')} without datastore_path")
++            msg = f"Cannot commit {entity_type} {self.get('uuid')} without datastore_path"
++            logger.error(msg)
++            if raise_on_error:
++                raise RuntimeError(msg)
+             return
+ 
+         uuid = self.get('uuid')
+         if not uuid:
+             entity_type = self.__class__.__name__
+-            logger.error(f"Cannot commit {entity_type} without UUID")
++            msg = f"Cannot commit {entity_type} without UUID"
++            logger.error(msg)
++            if raise_on_error:
++                raise RuntimeError(msg)
+             return
+ 
+         # Get data from subclass (may filter keys)
+@@ -670,7 +680,8 @@ class watch_base(dict):
+             data_dict = self._get_commit_data()
+         except Exception as e:
+             logger.error(f"Failed to prepare commit data for {uuid}: {e}")
+-            return
++            if raise_on_error:
++                raise
+ 
+         # Save to disk via subclass implementation
+         try:
+@@ -680,4 +691,6 @@ class watch_base(dict):
+             self._save_to_disk(data_dict, uuid)
+             logger.debug(f"Committed {entity_type} {uuid} to {uuid}/{filename}")
+         except Exception as e:
+-            logger.error(f"Failed to commit {uuid}: {e}")
+\ No newline at end of file
++            logger.error(f"Failed to commit {uuid}: {e}")
++            if raise_on_error:
++                raise
+\ No newline at end of file
+diff --git a/changedetectionio/notification_service.py b/changedetectionio/notification_service.py
+index d288f6c9..b39b53b5 100644
+--- a/changedetectionio/notification_service.py
++++ b/changedetectionio/notification_service.py
+@@ -14,6 +14,25 @@ import time
+ from changedetectionio.notification import default_notification_format, valid_notification_formats
+ 
+ 
++def _watch_check_is_stale(watch, check_epoch):
++    """Boundary check that is safe for duck-typed/mock watch objects.
++
++    check_epoch=None means a non-check notification (manual/test) and is never
++    stale. The method is looked up on the watch's TYPE so MagicMock-style test
++    doubles (whose arbitrary attributes are truthy auto-mocks) don't read as
++    stale.
++    """
++    if check_epoch is None or watch is None:
++        return False
++    fn = getattr(type(watch), 'check_result_is_stale', None)
++    if not callable(fn):
++        return False
++    try:
++        return bool(fn(watch, check_epoch))
++    except Exception:
++        return False
++
++
+ def _check_cascading_vars(datastore, var_name, watch):
+     """
+     Check notification variables in cascading priority:
+@@ -373,15 +392,25 @@ class NotificationService:
+         self.datastore = datastore
+         self.notification_q = notification_q
+     
+-    def queue_notification_for_watch(self, n_object: NotificationContextData, watch, date_index_from=-2, date_index_to=-1):
++    def queue_notification_for_watch(self, n_object: NotificationContextData, watch, date_index_from=-2, date_index_to=-1, check_epoch=None):
+         """
+         Queue a notification for a watch with full diff rendering and template variables
++
++        check_epoch stamps the notification with the history generation of the check
++        that produced it, so an already-queued notification is dropped (at enqueue
++        time and again in the notification runner) when the watch history was cleared
++        after the notification was produced. None = manual/test notification, never
++        filtered by a history boundary.
+         """
+         from changedetectionio.notification import USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH
+ 
+         if not isinstance(n_object, NotificationContextData):
+             raise TypeError(f"Expected NotificationContextData, got {type(n_object)}")
+ 
++        if _watch_check_is_stale(watch, check_epoch):
++            logger.debug(f"Not queueing notification for {watch.get('uuid')}: check epoch {check_epoch} crossed a history boundary")
++            return False
++
+         dates = []
+         trigger_text = ''
+ 
+@@ -423,6 +452,11 @@ class NotificationService:
+                                                     triggered_text=triggered_text,
+                                                     timestamp_changed=dates[date_index_to]))
+ 
++        if check_epoch is not None:
++            # Boundary tag checked again by NotificationQueue.put and by the
++            # notification runner immediately before delivery.
++            n_object['watch_history_epoch'] = int(check_epoch)
++
+         if self.notification_q:
+             logger.debug("Queued notification for sending")
+             self.notification_q.put(n_object)
+@@ -430,14 +464,21 @@ class NotificationService:
+             logger.debug("Not queued, no queue defined. Just returning processed data")
+             return n_object
+ 
+-    def send_content_changed_notification(self, watch_uuid):
++        return True
++
++    def send_content_changed_notification(self, watch_uuid, check_epoch=None):
+         """
+         Send notification when content changes are detected
+         """
+         n_object = NotificationContextData()
+         watch = self.datastore.data['watching'].get(watch_uuid)
+         if not watch:
+-            return
++            return False
++
++        # History cleared while the triggering check was running
++        if _watch_check_is_stale(watch, check_epoch):
++            logger.debug(f"Not sending change notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
++            return False
+ 
+         watch_history = watch.history
+         dates = list(watch_history.keys())
+@@ -468,20 +509,26 @@ class NotificationService:
+             queued = True
+ 
+             count = watch.get('notification_alert_count', 0) + 1
+-            self.datastore.update_watch(uuid=watch_uuid, update_obj={'notification_alert_count': count})
++            self.datastore.update_watch(uuid=watch_uuid,
++                                        update_obj={'notification_alert_count': count},
++                                        check_epoch=check_epoch)
+ 
+-            self.queue_notification_for_watch(n_object=n_object, watch=watch)
++            self.queue_notification_for_watch(n_object=n_object, watch=watch, check_epoch=check_epoch)
+ 
+         return queued
+ 
+-    def send_filter_failure_notification(self, watch_uuid):
++    def send_filter_failure_notification(self, watch_uuid, check_epoch=None):
+         """
+         Send notification when CSS/XPath filters fail consecutively
+         """
+         threshold = self.datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts')
+         watch = self.datastore.data['watching'].get(watch_uuid)
+         if not watch:
+-            return
++            return False
++
++        if _watch_check_is_stale(watch, check_epoch):
++            logger.debug(f"Not sending filter failure notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
++            return False
+ 
+         filter_list = ", ".join(watch['include_filters'])
+         # @todo - This could be a markdown template on the disk, apprise will convert the markdown to HTML+Plaintext parts in the email, and then 'markup_text_links_to_html_links' is not needed
+@@ -515,20 +562,28 @@ Thanks - Your omniscient changedetection.io installation.
+                 'watch_url': watch['url'],
+                 'watch_open_url': watch.open_link_override or watch['url'],
+                 'uuid': watch_uuid,
++                'watch_history_epoch': int(check_epoch) if check_epoch is not None else None,
+                 'screenshot': None
+             })
+             self.notification_q.put(n_object)
+             logger.debug(f"Sent filter not found notification for {watch_uuid}")
++            return True
+         else:
+             logger.debug(f"NOT sending filter not found notification for {watch_uuid} - no notification URLs")
++            return False
+ 
+-    def send_step_failure_notification(self, watch_uuid, step_n):
++    def send_step_failure_notification(self, watch_uuid, step_n, check_epoch=None):
+         """
+         Send notification when browser steps fail consecutively
+         """
+         watch = self.datastore.data['watching'].get(watch_uuid, False)
+         if not watch:
+-            return
++            return False
++
++        if _watch_check_is_stale(watch, check_epoch):
++            logger.debug(f"Not sending step failure notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
++            return False
++
+         threshold = self.datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts')
+ 
+         step = step_n
+@@ -564,10 +619,13 @@ Thanks - Your omniscient changedetection.io installation.
+             n_object.update({
+                 'watch_url': watch['url'],
+                 'watch_open_url': watch.open_link_override or watch['url'],
+-                'uuid': watch_uuid
++                'uuid': watch_uuid,
++                'watch_history_epoch': int(check_epoch) if check_epoch is not None else None
+             })
+             self.notification_q.put(n_object)
+             logger.error(f"Sent step not found notification for {watch_uuid}")
++            return True
++        return False
+ 
+ 
+ # Convenience functions for creating notification service instances
+diff --git a/changedetectionio/processors/base.py b/changedetectionio/processors/base.py
+index e7730e28..b301a718 100644
+--- a/changedetectionio/processors/base.py
++++ b/changedetectionio/processors/base.py
+@@ -23,6 +23,9 @@ class difference_detection_processor():
+     screenshot_format = SCREENSHOT_FORMAT_JPEG
+     last_raw_content_checksum = None
+     worker_id = None
++    # History boundary generation captured by the worker for this check; None for
++    # checks run outside the worker (previews, add-watch preload, tests).
++    check_epoch = None
+ 
+     def __init__(self, datastore, watch_uuid, worker_id=None):
+         self.datastore = datastore
+@@ -57,6 +60,15 @@ class difference_detection_processor():
+         if not watch:
+             return
+ 
++        # History boundary: never write a raw-content checksum for a check that
++        # was claimed before the watch history was cleared.
++        if watch.check_result_is_stale(self.check_epoch):
++            logger.debug(
++                f"Skipping raw-content checksum write for {self.watch_uuid}: "
++                f"pre-boundary check epoch {self.check_epoch}"
++            )
++            return
++
+         data_dir = watch.data_dir
+         if not data_dir:
+             return
+@@ -217,6 +229,11 @@ class difference_detection_processor():
+         if self.watch.has_browser_steps:
+             self.fetcher.browser_steps = browser_steps_get_valid_steps(self.watch.get('browser_steps', []))
+             self.fetcher.browser_steps_screenshot_path = os.path.join(self.datastore.datastore_path, self.watch.get('uuid'))
++            # History boundary tag so the fetcher's own step_*.jpeg/html writes
++            # are skipped when a clear happens while the browser steps are running.
++            self.fetcher.check_epoch = self.check_epoch
++            self.fetcher.datastore_ref = self.datastore
++            self.fetcher.check_watch_uuid = self.watch.get('uuid')
+ 
+         # Tweak the base config with the per-watch ones
+         from changedetectionio.jinja2_custom import render as jinja_render
+diff --git a/changedetectionio/processors/restock_diff/__init__.py b/changedetectionio/processors/restock_diff/__init__.py
+index a2402e99..41e6b44b 100644
+--- a/changedetectionio/processors/restock_diff/__init__.py
++++ b/changedetectionio/processors/restock_diff/__init__.py
+@@ -104,9 +104,14 @@ class Watch(BaseWatch):
+         self['restock'] = Restock(kw['default']['restock']) if kw.get('default') and kw['default'].get('restock') else Restock()
+ 
+ 
+-    def clear_watch(self):
+-        super().clear_watch()
++    def clear_watch(self, wait_for_in_flight=True, convergence_timeout=None):
++        # Same history-boundary contract as the base Watch; additionally reset the
++        # restock-specific runtime state and persist it with the boundary.
++        result = super().clear_watch(wait_for_in_flight=wait_for_in_flight,
++                                     convergence_timeout=convergence_timeout)
+         self.update({'restock': Restock()})
++        self.commit()
++        return result
+ 
+     def extra_notification_token_values(self):
+         values = super().extra_notification_token_values()
+diff --git a/changedetectionio/queue_handlers.py b/changedetectionio/queue_handlers.py
+index 720daa79..d01b5180 100644
+--- a/changedetectionio/queue_handlers.py
++++ b/changedetectionio/queue_handlers.py
+@@ -450,11 +450,40 @@ class NotificationQueue:
+     def set_datastore(self, datastore):
+         """Set datastore reference after initialization (for circular dependency handling)"""
+         self.datastore = datastore
+-    
++
++    def _item_crossed_history_boundary(self, item: Dict[str, Any]):
++        """True when a watch-tagged notification belongs to a pre-clear history generation.
++
++        Items without an epoch tag (manual/test notifications, global digests)
++        are never filtered here.
++        """
++        if not (self.datastore and isinstance(item, dict)):
++            return False
++        item_epoch = item.get('watch_history_epoch')
++        watch_uuid = item.get('uuid')
++        if item_epoch is None or not watch_uuid:
++            return False
++        watch = self.datastore.data['watching'].get(watch_uuid)
++        if watch is None:
++            return False
++        try:
++            return int(item_epoch) != watch.history_epoch
++        except (TypeError, ValueError):
++            return False
++
+     def put(self, item: Dict[str, Any], block: bool = True, timeout: Optional[float] = None):
+         """Thread-safe sync put with signal emission"""
+         logger.trace(f"NotificationQueue.put() called for item: {item.get('uuid', 'unknown')}, block={block}, timeout={timeout}")
+         try:
++            # Drop change notifications produced by checks from before a history clear
++            if self._item_crossed_history_boundary(item):
++                logger.info(
++                    f"Notification blocked - history boundary crossed for watch "
++                    f"{item.get('uuid')} (item epoch {item.get('watch_history_epoch')}, "
++                    f"current epoch {self.datastore.data['watching'].get(item.get('uuid')).history_epoch})"
++                )
++                return False
++
+             # Check if all notifications are muted
+             if self.datastore and self.datastore.data['settings']['application'].get('all_muted', False):
+                 logger.debug(f"Notification blocked - all notifications are muted: {item.get('uuid', 'unknown')}")
+@@ -479,6 +508,11 @@ class NotificationQueue:
+         logger.trace(f"NotificationQueue.async_put() called for item: {item.get('uuid', 'unknown')}, executor={executor}")
+         import asyncio
+         try:
++            # Drop pre-clear-generation notifications
++            if self._item_crossed_history_boundary(item):
++                logger.debug(f"Notification blocked - history boundary crossed: {item.get('uuid', 'unknown')}")
++                return False
++
+             # Check if all notifications are muted
+             if self.datastore and self.datastore.data['settings']['application'].get('all_muted', False):
+                 logger.debug(f"Notification blocked - all notifications are muted: {item.get('uuid', 'unknown')}")
+diff --git a/changedetectionio/store/__init__.py b/changedetectionio/store/__init__.py
+index 9885e172..882d2c4f 100644
+--- a/changedetectionio/store/__init__.py
++++ b/changedetectionio/store/__init__.py
+@@ -552,10 +552,21 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
+         except Exception as e:
+             logger.error(f"Failed to commit settings: {e}")
+ 
+-    def update_watch(self, uuid, update_obj):
++    def update_watch(self, uuid, update_obj, check_epoch=None):
+ 
+         # It's possible that the watch could be deleted before update
+-        if not self.__data['watching'].get(uuid):
++        watch = self.__data['watching'].get(uuid)
++        if not watch:
++            return
++
++        # History boundary: drop state write-backs from a check claimed before
++        # the watch history was cleared. The first check scheduled AFTER the
++        # boundary carries the new epoch and is never affected.
++        if Watch.model.result_write_is_stale(check_epoch, watch.history_epoch):
++            logger.debug(
++                f"Discarding state update for {uuid} from pre-boundary check "
++                f"(check epoch {check_epoch}, current epoch {watch.history_epoch})"
++            )
+             return
+ 
+         with self.lock:
+@@ -678,9 +689,29 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
+         return False
+ 
+     # Remove a watchs data but keep the entry (URL etc)
+-    def clear_watch_history(self, uuid):
+-        self.__data['watching'][uuid].clear_watch()
+-        self.__data['watching'][uuid].commit()
++    def clear_watch_history(self, uuid, wait_for_in_flight=True, convergence_timeout=None):
++        """Establish a history boundary for one watch and wipe pre-boundary data.
++
++        Single chokepoint used by every entry point (UI button, bulk list action,
++        REST DELETE, processor switch, the global clear-all background job) so
++        they all share the same boundary semantics.
++
++        Returns the diagnosable result dict produced by Watch.clear_watch():
++        {'ok', 'uuid', 'epoch', 'converged', 'file_errors', 'error'}.
++        """
++        return self.__data['watching'][uuid].clear_watch(
++            wait_for_in_flight=wait_for_in_flight,
++            convergence_timeout=convergence_timeout,
++        )
++
++    def get_clear_history_job_manager(self):
++        """Lazy singleton managing the persistent, resumable clear-all job."""
++        manager = getattr(self, '_clear_history_job_manager', None)
++        if manager is None:
++            from ..clear_history_job import ClearAllHistoryJobManager
++            manager = ClearAllHistoryJobManager(self)
++            self._clear_history_job_manager = manager
++        return manager
+ 
+     @property
+     def watch_limit(self):
+diff --git a/changedetectionio/tests/unit/test_history_boundary.py b/changedetectionio/tests/unit/test_history_boundary.py
+new file mode 100644
+index 00000000..ea38041e
+--- /dev/null
++++ b/changedetectionio/tests/unit/test_history_boundary.py
+@@ -0,0 +1,358 @@
++"""
++Tests for the history-clear "boundary" semantics.
++
++Every clear (single UI action, bulk list action, REST DELETE, processor switch,
++global clear-all job) establishes a durable ``history_clear_epoch`` boundary:
++
++* write-backs (snapshots, screenshots, fetched pages, error state) from a check
++  claimed before the clear are discarded;
++* queued change notifications from before the clear are never delivered;
++* the first check produced by normal scheduling AFTER the clear is allowed to
++  build the new first snapshot;
++* the global job is persistent, resumable and never re-clears a watch that
++  already got its boundary.
++
++These tests build an isolated in-process datastore (no live server) so they run
++identically on every platform.
++"""
++import json
++import os
++import shutil
++import tempfile
++import time
++import unittest
++
++from changedetectionio import worker_pool
++from changedetectionio.model import Watch
++from changedetectionio.queue_handlers import NotificationQueue
++from changedetectionio.store import ChangeDetectionStore
++
++
++class HistoryBoundaryTestBase(unittest.TestCase):
++    def setUp(self):
++        self.datastore_path = tempfile.mkdtemp()
++        self.store = ChangeDetectionStore(
++            datastore_path=self.datastore_path,
++            include_default_watches=False,
++        )
++
++    def tearDown(self):
++        self.store.stop_thread = True
++        time.sleep(0.05)
++        shutil.rmtree(self.datastore_path, ignore_errors=True)
++
++    def _wait_for_job(self, manager, tries=200):
++        for _ in range(tries):
++            st = manager.status()
++            if st['status'] in ('completed', 'completed_with_errors'):
++                return st
++            time.sleep(0.02)
++        raise AssertionError(f"Job did not finish: {manager.status()}")
++
++
++class TestWatchModelBoundary(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.mkdtemp()
++        self.mock_datastore = {'settings': {'application': {}}, 'watching': {}}
++
++    def tearDown(self):
++        shutil.rmtree(self.tmp, ignore_errors=True)
++
++    def _watch(self):
++        return Watch.model(datastore_path=self.tmp,
++                           __datastore=self.mock_datastore,
++                           default={'url': 'https://example.com'})
++
++    def test_stale_check_writes_are_dropped(self):
++        watch = self._watch()
++        watch.ensure_data_dir_exists()
++
++        # A pre-clear check writes a snapshot
++        watch.save_history_blob("v1", 1000, "snap1")
++        self.assertEqual(len(watch.history), 1)
++
++        result = watch.clear_watch(wait_for_in_flight=False)
++        self.assertTrue(result['ok'])
++        self.assertEqual(result['epoch'], 1)
++        self.assertEqual(len(watch.history), 0)
++
++        # Writes tagged with the claimed (old) epoch must not cross the boundary
++        self.assertIsNone(watch.save_history_blob("old", 2000, "old", check_epoch=0))
++        self.assertIsNone(watch.save_history_blob("old", 2001, "old", check_epoch=0))
++        self.assertEqual(len(watch.history), 0)
++
++        watch.save_screenshot(b"stale-png", check_epoch=0)
++        self.assertFalse(os.path.isfile(os.path.join(watch.data_dir, "last-screenshot.png")))
++        watch.save_error_text("stale error", check_epoch=0)
++        self.assertFalse(os.path.isfile(os.path.join(watch.data_dir, "last-error.txt")))
++
++        # The first post-boundary check (new epoch) IS allowed: new first snapshot
++        watch.save_history_blob("new first", 3000, "new", check_epoch=1)
++        self.assertEqual(len(watch.history), 1)
++        # Untagged writes (UI/imports/tests) are always allowed
++        watch.save_error_text("manual", check_epoch=None)
++        self.assertTrue(os.path.isfile(os.path.join(watch.data_dir, "last-error.txt")))
++
++    def test_repeated_clears_advance_epoch_and_preserve_config(self):
++        watch = self._watch()
++        watch['paused'] = True
++        watch.ensure_data_dir_exists()
++        cfg = os.path.join(watch.data_dir, "text_json_diff.json")
++        with open(cfg, 'w') as f:
++            f.write('{"include_filters": ["body"]}')
++        watch.save_history_blob("v1", 1000, "s1")
++
++        r1 = watch.clear_watch(wait_for_in_flight=False)
++        r2 = watch.clear_watch(wait_for_in_flight=False)
++        self.assertEqual((r1['epoch'], r2['epoch']), (1, 2))
++        self.assertEqual(watch.history_epoch, 2)
++        self.assertIs(watch.get('paused'), True)
++        self.assertTrue(os.path.isfile(cfg))
++        self.assertEqual(len(watch.history), 0)
++
++
++class TestStoreBoundary(HistoryBoundaryTestBase):
++    def test_clear_returns_diagnosable_result_and_gates_updates(self):
++        uuid = self.store.add_watch(url="https://example.com")
++        watch = self.store.data['watching'][uuid]
++        watch.save_history_blob("v1", 1000, "s1")
++
++        result = self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++        self.assertTrue(result['ok'])
++        self.assertIsNone(result['error'])
++        self.assertTrue(result['converged'])
++        self.assertEqual(result['epoch'], 1)
++        self.assertEqual(watch.history_n, 0)
++
++        # A stale check's state write-back is dropped entirely
++        self.store.update_watch(uuid, {'last_checked': 123, 'last_error': 'boom'}, check_epoch=0)
++        self.assertEqual(int(watch['last_checked']), 0)
++        self.assertFalse(watch['last_error'])
++
++        # New generation update lands normally
++        self.store.update_watch(uuid, {'last_checked': 456}, check_epoch=1)
++        self.assertEqual(int(watch['last_checked']), 456)
++
++        # Untagged update (UI) lands normally
++        self.store.update_watch(uuid, {'page_title': 'hi'})
++        self.assertEqual(watch['page_title'], 'hi')
++
++        # The boundary survived on disk
++        with open(os.path.join(watch.data_dir, "watch.json")) as f:
++            self.assertEqual(json.load(f)['history_clear_epoch'], 1)
++
++    def test_clear_while_check_is_running_reports_non_convergence(self):
++        uuid = self.store.add_watch(url="https://example.com")
++        self.assertTrue(worker_pool.claim_uuid_for_processing(uuid, "test-worker"))
++        try:
++            result = self.store.clear_watch_history(uuid, convergence_timeout=0.2)
++        finally:
++            worker_pool.release_uuid_from_processing(uuid, "test-worker")
++
++        # Boundary still established safely via the epoch guard
++        self.assertTrue(result['ok'])
++        self.assertFalse(result['converged'])
++        self.assertEqual(self.store.data['watching'][uuid].history_epoch, 1)
++
++
++class TestNotificationBoundary(HistoryBoundaryTestBase):
++    def test_notification_queue_drops_pre_boundary_items(self):
++        uuid = self.store.add_watch(url="https://example.com")
++
++        q = NotificationQueue()
++        q.set_datastore(self.store)
++
++        old = {'uuid': uuid, 'watch_history_epoch': 0}
++        new = {'uuid': uuid, 'watch_history_epoch': 1}
++        manual = {'uuid': uuid}  # no epoch tag: test/manual notification
++
++        self.assertTrue(q.put(old))  # epoch 0 == current 0: accepted
++        self.assertEqual(q.qsize(), 1)
++        q.get()
++
++        self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++
++        self.assertFalse(q.put(old))  # queued BEFORE the clear: dropped
++        self.assertEqual(q.qsize(), 0)
++        self.assertTrue(q.put(new))  # post-boundary: delivered
++        self.assertTrue(q.put(manual))  # untagged: delivered
++
++    def test_notification_service_stamps_and_filters_epoch(self):
++        from changedetectionio.notification_service import NotificationService
++        uuid = self.store.add_watch(url="https://example.com")
++        self.store.update_watch(uuid, {'notification_urls': ['json://example']})
++
++        q = NotificationQueue()
++        q.set_datastore(self.store)
++        svc = NotificationService(self.store, q)
++
++        # A step-failure notification carrying the old epoch is rejected after clear
++        self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++        self.assertFalse(svc.send_step_failure_notification(uuid, 1, check_epoch=0))
++        self.assertEqual(q.qsize(), 0)
++
++        # Current epoch is tagged on the queued item
++        self.assertTrue(svc.send_step_failure_notification(uuid, 1, check_epoch=1))
++        item = q.get()
++        self.assertEqual(item['watch_history_epoch'], 1)
++
++
++class TestWorkerArtifactHelpers(HistoryBoundaryTestBase):
++    def test_cleanup_error_artifacts_respects_boundary(self):
++        from changedetectionio.worker import cleanup_error_artifacts
++        uuid = self.store.add_watch(url="https://example.com")
++        watch = self.store.data['watching'][uuid]
++        watch.ensure_data_dir_exists()
++        err = os.path.join(watch.data_dir, "last-error.txt")
++
++        self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++        # A post-boundary check produced an error file
++        with open(err, 'w') as f:
++            f.write("new boundary error")
++
++        # A stale (pre-boundary) successful check must not delete the new file
++        cleanup_error_artifacts(uuid, self.store, check_epoch=0)
++        self.assertTrue(os.path.isfile(err))
++
++        # A current-generation check may clean it
++        cleanup_error_artifacts(uuid, self.store, check_epoch=1)
++        self.assertFalse(os.path.isfile(err))
++
++    def test_fetcher_check_generation_is_current(self):
++        from changedetectionio.content_fetchers.base import Fetcher
++        uuid = self.store.add_watch(url="https://example.com")
++
++        f = Fetcher()
++        # Interactive fetch: no epoch, always current
++        self.assertTrue(f.check_generation_is_current())
++
++        f.check_epoch = 0
++        f.datastore_ref = self.store
++        f.check_watch_uuid = uuid
++        self.assertTrue(f.check_generation_is_current())
++        self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++        self.assertFalse(f.check_generation_is_current())  # boundary moved
++        f.check_epoch = 1
++        self.assertTrue(f.check_generation_is_current())
++
++
++class TestRestockWatchBoundary(HistoryBoundaryTestBase):
++    def test_restock_clear_returns_boundary_and_resets_restock_state(self):
++        uuid = self.store.add_watch(url="https://example.com",
++                                    extras={'processor': 'restock_diff'})
++        watch = self.store.data['watching'][uuid]
++        from changedetectionio.processors.restock_diff import Watch as RestockWatch
++        self.assertIsInstance(watch, RestockWatch)
++
++        watch['restock']['in_stock'] = True
++        watch.commit()
++        watch.save_history_blob("price 100", 1000, "s1")
++
++        result = self.store.clear_watch_history(uuid, wait_for_in_flight=False)
++        # The override must keep the base boundary contract (diagnosable dict)
++        self.assertTrue(result['ok'])
++        self.assertEqual(result['epoch'], 1)
++        self.assertEqual(watch.history_n, 0)
++        self.assertEqual(watch.history_epoch, 1)
++        # Restock runtime state is reset AND persisted
++        self.assertFalse(watch['restock'].get('in_stock'))
++        with open(os.path.join(watch.data_dir, "watch.json")) as f:
++            on_disk = json.load(f)
++        self.assertEqual(on_disk['history_clear_epoch'], 1)
++        self.assertFalse(on_disk['restock'].get('in_stock'))
++
++
++class TestGlobalClearHistoryJob(HistoryBoundaryTestBase):
++    def test_global_job_clears_all_current_watches(self):
++        u1 = self.store.add_watch(url="https://example.com")
++        u2 = self.store.add_watch(url="https://example.org")
++        for u in (u1, u2):
++            self.store.data['watching'][u].save_history_blob("x", 1000, "s")
++
++        manager = self.store.get_clear_history_job_manager()
++        action, state = manager.start_or_resume()
++        self.assertEqual(action, 'started')
++        self.assertEqual(state['status'], 'running')
++
++        st = self._wait_for_job(manager)
++        self.assertEqual(st['status'], 'completed')
++        self.assertEqual((st['total'], st['cleared'], st['failed']), (2, 2, 0))
++        self.assertEqual(self.store.data['watching'][u1].history_epoch, 1)
++        self.assertEqual(self.store.data['watching'][u2].history_epoch, 1)
++
++        # A second explicit request starts a fresh run over the current watch set
++        action, _ = manager.start_or_resume()
++        self.assertEqual(action, 'started')
++        st = self._wait_for_job(manager)
++        self.assertEqual(st['status'], 'completed')
++        self.assertEqual(self.store.data['watching'][u1].history_epoch, 2)
++
++    def test_global_job_resumes_without_reclearing_done_watches(self):
++        u1 = self.store.add_watch(url="https://example.com")
++        u2 = self.store.add_watch(url="https://example.org")
++
++        manager = self.store.get_clear_history_job_manager()
++        # u1 was cleared at epoch 1 (boundary done); u2 never ran - simulate a crash
++        self.store.data['watching'][u1]['history_clear_epoch'] = 1
++        self.store.data['watching'][u1].commit()
++        forced = {
++            'job_id': '11111111-2222-3333-4444-555555555555',
++            'status': 'running',
++            'created_at': time.time() - 5,
++            'updated_at': time.time() - 5,
++            'finished_at': None,
++            'convergence_timeout': 1.0,
++            'items': [
++                {'uuid': u1, 'status': 'cleared', 'epoch': 1, 'error': None},
++                {'uuid': u2, 'status': 'pending', 'epoch': None, 'error': None},
++            ],
++        }
++        with open(manager.path, 'w') as f:
++            json.dump(forced, f)
++
++        # A genuine first snapshot AFTER u1's boundary
++        w1 = self.store.data['watching'][u1]
++        w1.save_history_blob("post-boundary first", 9000, "post")
++
++        recovered = manager.recover_interrupted()
++        self.assertEqual(recovered['status'], 'interrupted')
++        action, _ = manager.start_or_resume()
++        self.assertEqual(action, 'resumed')
++
++        st = self._wait_for_job(manager)
++        self.assertEqual(st['status'], 'completed')
++        items = {i['uuid']: i for i in st['items']}
++        self.assertEqual(items[u2]['status'], 'cleared')
++        # u1 must NOT have been re-cleared: epoch and new snapshot survive
++        self.assertEqual(self.store.data['watching'][u1].history_epoch, 1)
++        self.assertEqual(w1.history_n, 1)
++
++    def test_stale_running_state_self_heals_and_gone_watches_finish_job(self):
++        u1 = self.store.add_watch(url="https://example.com")
++        manager = self.store.get_clear_history_job_manager()
++
++        # Job file says running but no thread exists (process restarted), and the
++        # pending watch has since been deleted.
++        forced = {
++            'job_id': 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
++            'status': 'running',
++            'created_at': time.time(), 'updated_at': time.time(), 'finished_at': None,
++            'convergence_timeout': 1.0,
++            'items': [{'uuid': u1, 'status': 'pending', 'epoch': None, 'error': None}],
++        }
++        with open(manager.path, 'w') as f:
++            json.dump(forced, f)
++        self.store.delete(u1)
++
++        st = manager.status()
++        self.assertEqual(st['status'], 'interrupted')  # never stuck showing "running"
++
++        action, _ = manager.start_or_resume()
++        self.assertEqual(action, 'resumed')
++        st = self._wait_for_job(manager)
++        self.assertEqual(st['status'], 'completed')
++        self.assertEqual(st['gone'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/changedetectionio/worker.py b/changedetectionio/worker.py
+index 14a7b2e9..ebed2c4f 100644
+--- a/changedetectionio/worker.py
++++ b/changedetectionio/worker.py
+@@ -29,6 +29,17 @@ IN_PYTEST = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+ DEFER_SLEEP_TIME_ALREADY_QUEUED = 0.3 if IN_PYTEST else 10.0
+ 
+ 
++class StaleCheckGeneration(Exception):
++    """Raised when the running check finds its history generation was superseded by a clear."""
++
++    def __init__(self, check_epoch, current_epoch):
++        super().__init__(
++            f"Check generation {check_epoch} is stale (history boundary is now {current_epoch})"
++        )
++        self.check_epoch = check_epoch
++        self.current_epoch = current_epoch
++
++
+ def set_watch_minitext_status(watch, status):
+     """
+     Set a transient status line for a watch (e.g. "Fetching...", "Querying AI/LLM..").
+@@ -79,6 +90,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+     while not app.config.exit.is_set():
+         update_handler = None
+         watch = None
++        # History boundary generation captured for THIS claimed check. 0 until a
++        # job is claimed; write-backs tagged with a stale value are dropped.
++        check_epoch = 0
+         processing_exception = None  # Reset at start of each iteration to prevent state bleeding
+ 
+         try:
+@@ -100,6 +114,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                 worker_pool.queue_item_async_safe(q, deferred_item, silent=True)
+                 continue
+ 
++            # Capture the history boundary generation the moment the check is
++            # claimed. If an admin clears this watch's history while we are
++            # fetching ("Checking now..."), the epoch moves and every result
++            # write-back below (state, snapshots, screenshots, fetched pages,
++            # error artifacts, notifications) is discarded as pre-boundary.
++            # A check claimed AFTER the clear sees the new epoch and is allowed.
++            _claimed_watch = datastore.data['watching'].get(uuid)
++            check_epoch = _claimed_watch.history_epoch if _claimed_watch is not None else 0
++
+         except asyncio.TimeoutError:
+             # No jobs available - check if we should restart based on time while idle
+             runtime = time.time() - start_time
+@@ -157,6 +180,11 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+ 
+                 watch = datastore.data['watching'].get(uuid)
+ 
++                # All state write-backs from this check go through this so a
++                # history clear mid-check can discard them wholesale.
++                def update_watch_guarded(update_obj_arg):
++                    datastore.update_watch(uuid=uuid, update_obj=update_obj_arg, check_epoch=check_epoch)
++
+                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
+ 
+                 try:
+@@ -181,8 +209,20 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                                                                          watch_uuid=uuid,
+                                                                          worker_id=worker_id)
+ 
++                    # Boundary generation for this claimed check - gates the
++                    # handler's own writes (raw-content checksum, browser-step
++                    # screenshots) even when plugins wrap the handler below.
++                    try:
++                        update_handler.check_epoch = check_epoch
++                    except Exception:
++                        pass
++
+                     # Allow plugins to modify/wrap the update_handler
+                     update_handler = apply_update_handler_alter(update_handler, watch, datastore)
++                    try:
++                        update_handler.check_epoch = check_epoch
++                    except Exception:
++                        pass
+ 
+                     set_watch_minitext_status(watch, "Fetching...")
+ 
+@@ -205,12 +245,12 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+ 
+                 except ProcessorException as e:
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot)
++                        watch.save_screenshot(screenshot=e.screenshot, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+                     if e.xpath_data:
+-                        watch.save_xpath_data(data=e.xpath_data)
++                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
+                         e.xpath_data = None  # Free memory immediately
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': e.message})
++                    update_watch_guarded({'last_error': e.message})
+                     process_changedetection_results = False
+ 
+                 except content_fetchers_exceptions.ReplyWithContentButNoText as e:
+@@ -223,18 +263,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                         else:
+                             extra_help = ", it's possible that the filters were found, but contained no usable text."
+ 
+-                    datastore.update_watch(uuid=uuid, update_obj={
++                    update_watch_guarded({
+                         'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}"
+                     })
+ 
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
++                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+ 
+                     if e.xpath_data:
+-                        watch.save_xpath_data(data=e.xpath_data)
++                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
+                         e.xpath_data = None  # Free memory immediately
+-                        
++
+                     process_changedetection_results = False
+ 
+                 except content_fetchers_exceptions.Non200ErrorCodeReceived as e:
+@@ -251,15 +291,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                         err_text = f"Error - Request returned a HTTP error code {e.status_code}{extra}"
+ 
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
++                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+                     if e.xpath_data:
+-                        watch.save_xpath_data(data=e.xpath_data, as_error=True)
++                        watch.save_xpath_data(data=e.xpath_data, as_error=True, check_epoch=check_epoch)
+                         e.xpath_data = None  # Free memory immediately
+                     if e.page_text:
+-                        watch.save_error_text(contents=e.page_text)
++                        watch.save_error_text(contents=e.page_text, check_epoch=check_epoch)
+ 
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
++                    update_watch_guarded({'last_error': err_text})
+                     process_changedetection_results = False
+ 
+                 except FilterNotFoundInResponse as e:
+@@ -268,15 +308,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                     logger.debug(f"Received FilterNotFoundInResponse exception for {uuid}")
+ 
+                     err_text = "Warning, no filters were found, no change detection ran - Did the page change layout? update your Visual Filter if necessary."
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
++                    update_watch_guarded({'last_error': err_text})
+ 
+                     # Filter wasnt found, but we should still update the visual selector so that they can have a chance to set it up again
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot)
++                        watch.save_screenshot(screenshot=e.screenshot, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+ 
+                     if e.xpath_data:
+-                        watch.save_xpath_data(data=e.xpath_data)
++                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
+                         e.xpath_data = None  # Free memory immediately
+ 
+                     # Only when enabled, send the notification
+@@ -287,15 +327,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                         threshold = datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts', 0)
+                         logger.debug(f"FilterNotFoundInResponse - Filter for {uuid} not found, consecutive_filter_failures: {c} of threshold {threshold}")
+                         if c >= threshold:
+-                            if not watch.get('notification_muted'):
++                            if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
+                                 logger.debug(f"FilterNotFoundInResponse - Sending filter failed notification for {uuid}")
+-                                await send_filter_failure_notification(uuid, notification_q, datastore)
++                                await send_filter_failure_notification(uuid, notification_q, datastore, check_epoch=check_epoch)
+                             c = 0
+                             logger.debug(f"FilterNotFoundInResponse - Reset filter failure count back to zero")
+                         else:
+                             logger.debug(f"FilterNotFoundInResponse - {c} of threshold {threshold}..")
+ 
+-                        datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
++                        update_watch_guarded({'consecutive_filter_failures': c})
+                     else:
+                         logger.trace(f"FilterNotFoundInResponse - {uuid} - filter_failure_notification_send not enabled, skipping")
+ 
+@@ -309,17 +349,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                     # Reset the edited flag since we successfully completed the check
+                     watch.reset_watch_edited_flag()
+                     # Page was fetched successfully - clear any previous error state
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': False})
+-                    cleanup_error_artifacts(uuid, datastore)
+-                    
++                    update_watch_guarded({'last_error': False})
++                    cleanup_error_artifacts(uuid, datastore, check_epoch=check_epoch)
++
+                 except content_fetchers_exceptions.BrowserConnectError as e:
+-                    datastore.update_watch(uuid=uuid,
+-                                         update_obj={'last_error': e.msg})
++                    update_watch_guarded({'last_error': e.msg})
+                     process_changedetection_results = False
+-                    
++
+                 except content_fetchers_exceptions.BrowserFetchTimedOut as e:
+-                    datastore.update_watch(uuid=uuid,
+-                                         update_obj={'last_error': e.msg})
++                    update_watch_guarded({'last_error': e.msg})
+                     process_changedetection_results = False
+                     
+                 except content_fetchers_exceptions.BrowserStepsStepException as e:
+@@ -341,8 +379,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+ 
+                     logger.debug(f"BrowserSteps exception at step {error_step} {str(e.original_e)}")
+ 
+-                    datastore.update_watch(uuid=uuid,
+-                                         update_obj={'last_error': err_text,
++                    update_watch_guarded({'last_error': err_text,
+                                                    'browser_steps_last_error_step': error_step})
+ 
+                     if watch.get('filter_failure_notification_send', False):
+@@ -352,53 +389,56 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                         threshold = datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts', 0)
+                         logger.error(f"Step for {uuid} not found, consecutive_filter_failures: {c}")
+                         if threshold > 0 and c >= threshold:
+-                            if not watch.get('notification_muted'):
+-                                await send_step_failure_notification(watch_uuid=uuid, step_n=e.step_n, notification_q=notification_q, datastore=datastore)
++                            if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
++                                await send_step_failure_notification(watch_uuid=uuid, step_n=e.step_n,
++                                                                     notification_q=notification_q,
++                                                                     datastore=datastore,
++                                                                     check_epoch=check_epoch)
+                             c = 0
+ 
+-                        datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
++                        update_watch_guarded({'consecutive_filter_failures': c})
+ 
+                     process_changedetection_results = False
+ 
+                 except content_fetchers_exceptions.EmptyReply as e:
+                     # Some kind of custom to-str handler in the exception handler that does this?
+                     err_text = "EmptyReply - try increasing 'Wait seconds before extracting text', Status Code {}".format(e.status_code)
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
++                    update_watch_guarded({'last_error': err_text,
+                                                                 'last_check_status': e.status_code})
+                     process_changedetection_results = False
+-                    
++
+                 except content_fetchers_exceptions.ScreenshotUnavailable as e:
+                     err_text = "Screenshot unavailable, page did not render fully in the expected time or page was too long - try increasing 'Wait seconds before extracting text'"
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
++                    update_watch_guarded({'last_error': err_text,
+                                                                 'last_check_status': e.status_code})
+                     process_changedetection_results = False
+-                    
++
+                 except content_fetchers_exceptions.JSActionExceptions as e:
+                     err_text = "Error running JS Actions - Page request - "+e.message
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
++                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
++                    update_watch_guarded({'last_error': err_text,
+                                                                 'last_check_status': e.status_code})
+                     process_changedetection_results = False
+-                    
++
+                 except content_fetchers_exceptions.PageUnloadable as e:
+                     err_text = "Page request from server didnt respond correctly"
+                     if e.message:
+                         err_text = "{} - {}".format(err_text, e.message)
+ 
+                     if e.screenshot:
+-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
++                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
+                         e.screenshot = None  # Free memory immediately
+ 
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
++                    update_watch_guarded({'last_error': err_text,
+                                                                 'last_check_status': e.status_code,
+                                                                 'has_ldjson_price_data': None})
+                     process_changedetection_results = False
+-                    
++
+                 except content_fetchers_exceptions.BrowserStepsInUnsupportedFetcher as e:
+                     err_text = "This watch has Browser Steps configured and so it cannot run with the 'Basic fast Plaintext/HTTP Client', either remove the Browser Steps or select a Chrome fetcher."
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
++                    update_watch_guarded({'last_error': err_text})
+                     process_changedetection_results = False
+                     logger.error(f"Exception (BrowserStepsInUnsupportedFetcher) reached processing watch UUID: {uuid}")
+ 
+@@ -406,7 +446,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                     import traceback
+                     logger.error(f"Worker {worker_id} exception processing watch UUID: {uuid}")
+                     logger.exception(f"Worker {worker_id} full exception details:")
+-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
++                    update_watch_guarded({'last_error': "Exception: " + str(e)})
+                     process_changedetection_results = False
+ 
+                 else:
+@@ -419,7 +459,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                         update_obj['consecutive_filter_failures'] = 0
+ 
+                     update_obj['last_error'] = False
+-                    cleanup_error_artifacts(uuid, datastore)
++                    cleanup_error_artifacts(uuid, datastore, check_epoch=check_epoch)
+ 
+                 if not datastore.data['watching'].get(uuid):
+                     continue
+@@ -427,6 +467,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                 logger.debug(f"Processing watch UUID: {uuid} - xpath_data length returned {len(update_handler.xpath_data) if update_handler and update_handler.xpath_data else 'empty.'}")
+                 if update_handler and process_changedetection_results:
+                     try:
++                        # History was cleared while this check was fetching: none of its
++                        # results may cross the boundary. Model/store-level guards would
++                        # drop the individual writes anyway, but jump out here to avoid
++                        # wasted LLM/diff work and to never queue an old notification.
++                        if watch.check_result_is_stale(check_epoch):
++                            raise StaleCheckGeneration(check_epoch, watch.history_epoch)
++
+                         # Reset the edited flag BEFORE update_watch (which calls watch.update() and would set it again)
+                         watch.reset_watch_edited_flag()
+ 
+@@ -532,18 +579,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                             except Exception as e:
+                                 logger.warning(f"LLM evaluation error for {uuid}: {e}")
+ 
+-                        datastore.update_watch(uuid=uuid, update_obj=update_obj)
++                        datastore.update_watch(uuid=uuid, update_obj=update_obj, check_epoch=check_epoch)
+ 
+                         if changed_detected or not watch.history_n:
+                             if update_handler.screenshot:
+-                                watch.save_screenshot(screenshot=update_handler.screenshot)
++                                watch.save_screenshot(screenshot=update_handler.screenshot, check_epoch=check_epoch)
+                                 # Free screenshot memory immediately after saving
+                                 update_handler.screenshot = None
+                                 if hasattr(update_handler, 'fetcher') and hasattr(update_handler.fetcher, 'screenshot'):
+                                     update_handler.fetcher.screenshot = None
+ 
+                             if update_handler.xpath_data:
+-                                watch.save_xpath_data(data=update_handler.xpath_data)
++                                watch.save_xpath_data(data=update_handler.xpath_data, check_epoch=check_epoch)
+                                 # Free xpath data memory
+                                 update_handler.xpath_data = None
+                                 if hasattr(update_handler, 'fetcher') and hasattr(update_handler.fetcher, 'xpath_data'):
+@@ -557,7 +604,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+ 
+                             watch.save_history_blob(contents=contents,
+                                                     timestamp=int(fetch_start_time),
+-                                                    snapshot_id=update_obj.get('previous_md5', 'none'))
++                                                    snapshot_id=update_obj.get('previous_md5', 'none'),
++                                                    check_epoch=check_epoch)
+ 
+                             # Save AI summary file now that the new snapshot is committed —
+                             # watch.history.keys()[-1] now reflects the just-saved version,
+@@ -584,29 +632,43 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                                         _llm_from_version,
+                                         _llm_to_version,
+                                         prompt=_llm_cache_prompt,
++                                        check_epoch=check_epoch,
+                                     )
+                                 except Exception as _fe:
+                                     logger.warning(f"Could not write change-summary file for {uuid}: {_fe}")
+ 
+                             empty_pages_are_a_change = datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
+                             if update_handler.fetcher.content or (not update_handler.fetcher.content and empty_pages_are_a_change):
+-                                watch.save_last_fetched_html(contents=update_handler.fetcher.content, timestamp=int(fetch_start_time))
++                                watch.save_last_fetched_html(contents=update_handler.fetcher.content,
++                                                             timestamp=int(fetch_start_time),
++                                                             check_epoch=check_epoch)
+ 
+                             # Explicitly delete large content variables to free memory IMMEDIATELY after saving
+                             # These are no longer needed after being saved to history
+                             del contents
+ 
+-                            # Send notifications on second+ check
++                            # Send notifications on second+ check (the notification queue
++                            # and runner independently re-verify the epoch, so a change
++                            # notification queued just before the clear is dropped too)
+                             if watch.history_n >= 2:
+                                 logger.info(f"Change detected in UUID {uuid} - {watch['url']}")
+-                                if not watch.get('notification_muted'):
+-                                    await send_content_changed_notification(uuid, notification_q, datastore)
++                                if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
++                                    await send_content_changed_notification(uuid, notification_q, datastore,
++                                                                            check_epoch=check_epoch)
++
++                    except StaleCheckGeneration:
++                        # History cleared mid-check - every write-back is epoch-gated;
++                        # just skip the rest of this generation's result processing.
++                        logger.info(
++                            f"Worker {worker_id} skipping result processing for {uuid}: "
++                            f"check epoch {check_epoch} superseded by history boundary {watch.history_epoch}"
++                        )
+ 
+                     except Exception as e:
+ 
+                         logger.critical(f"Worker {worker_id} exception in process_changedetection_results")
+                         logger.exception(f"Worker {worker_id} full exception details:")
+-                        datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)})
++                        datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)}, check_epoch=check_epoch)
+ 
+ 
+                 # Always record attempt count
+@@ -641,10 +703,11 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+                     if update_handler.fetcher.favicon_blob and update_handler.fetcher.favicon_blob.get('base64'):
+                         watch.bump_favicon(url=update_handler.fetcher.favicon_blob.get('url'),
+                                            favicon_base_64=update_handler.fetcher.favicon_blob.get('base64'),
+-                                           mime_type=update_handler.fetcher.favicon_blob.get('mime_type')
++                                           mime_type=update_handler.fetcher.favicon_blob.get('mime_type'),
++                                           check_epoch=check_epoch
+                                            )
+ 
+-                    datastore.update_watch(uuid=uuid, update_obj=final_updates)
++                    datastore.update_watch(uuid=uuid, update_obj=final_updates, check_epoch=check_epoch)
+ 
+                     # NOW clear fetcher content - after all processing is complete
+                     # This is the last point where we need the fetcher data
+@@ -668,7 +731,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+ 
+             # Also update the watch with error information
+             if datastore and uuid in datastore.data['watching']:
+-                datastore.update_watch(uuid=uuid, update_obj={'last_error': f"Worker error: {str(e)}"})
++                datastore.update_watch(uuid=uuid,
++                                       update_obj={'last_error': f"Worker error: {str(e)}"},
++                                       check_epoch=check_epoch)
+         
+         finally:
+             # Always cleanup - this runs whether there was an exception or not
+@@ -777,8 +842,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
+     return "shutdown"
+ 
+ 
+-def cleanup_error_artifacts(uuid, datastore):
+-    """Helper function to clean up error artifacts"""
++def cleanup_error_artifacts(uuid, datastore, check_epoch=None):
++    """Helper function to clean up error artifacts.
++
++    Tagged with the calling check's generation: when history was cleared while
++    the check was running, on-disk error files belong to the new boundary and
++    must not be removed by this stale check.
++    """
++    watch = datastore.data['watching'].get(uuid) if datastore else None
++    if watch is not None and watch.check_result_is_stale(check_epoch):
++        logger.debug(f"Skipping error-artifact cleanup for {uuid} from a pre-boundary check")
++        return
++
+     cleanup_files = ["last-error-screenshot.png", "last-error.txt"]
+     for f in cleanup_files:
+         full_path = os.path.join(datastore.datastore_path, uuid, f)
+@@ -787,40 +862,40 @@ def cleanup_error_artifacts(uuid, datastore):
+ 
+ 
+ 
+-async def send_content_changed_notification(watch_uuid, notification_q, datastore):
++async def send_content_changed_notification(watch_uuid, notification_q, datastore, check_epoch=None):
+     """Helper function to queue notifications using the new notification service"""
+     try:
+         from changedetectionio.notification_service import create_notification_service
+-        
++
+         # Create notification service instance
+         notification_service = create_notification_service(datastore, notification_q)
+-        
+-        notification_service.send_content_changed_notification(watch_uuid)
++
++        notification_service.send_content_changed_notification(watch_uuid, check_epoch=check_epoch)
+     except Exception as e:
+         logger.error(f"Error sending notification for {watch_uuid}: {e}")
+ 
+ 
+-async def send_filter_failure_notification(watch_uuid, notification_q, datastore):
++async def send_filter_failure_notification(watch_uuid, notification_q, datastore, check_epoch=None):
+     """Helper function to send filter failure notifications using the new notification service"""
+     try:
+         from changedetectionio.notification_service import create_notification_service
+-        
++
+         # Create notification service instance
+         notification_service = create_notification_service(datastore, notification_q)
+-        
+-        notification_service.send_filter_failure_notification(watch_uuid)
++
++        notification_service.send_filter_failure_notification(watch_uuid, check_epoch=check_epoch)
+     except Exception as e:
+         logger.error(f"Error sending filter failure notification for {watch_uuid}: {e}")
+ 
+ 
+-async def send_step_failure_notification(watch_uuid, step_n, notification_q, datastore):
++async def send_step_failure_notification(watch_uuid, step_n, notification_q, datastore, check_epoch=None):
+     """Helper function to send step failure notifications using the new notification service"""
+     try:
+         from changedetectionio.notification_service import create_notification_service
+-        
++
+         # Create notification service instance
+         notification_service = create_notification_service(datastore, notification_q)
+-        
+-        notification_service.send_step_failure_notification(watch_uuid, step_n)
++
++        notification_service.send_step_failure_notification(watch_uuid, step_n, check_epoch=check_epoch)
+     except Exception as e:
+         logger.error(f"Error sending step failure notification for {watch_uuid}: {e}")
+\ No newline at end of file
+diff --git a/changedetectionio/worker_pool.py b/changedetectionio/worker_pool.py
+index 027ae6f6..4ae6c9a8 100644
+--- a/changedetectionio/worker_pool.py
++++ b/changedetectionio/worker_pool.py
+@@ -348,6 +348,27 @@ def is_watch_running(watch_uuid):
+         return watch_uuid in currently_processing_uuids
+ 
+ 
++def wait_for_watch_idle(watch_uuid, timeout=30.0, poll_interval=0.05):
++    """Wait until no worker is processing watch_uuid (history-clear task convergence).
++
++    Bounded so a slow/hung check can never stall a history clear forever: on
++    timeout the caller proceeds and relies on the history-epoch write guard.
++
++    Returns:
++        bool: True if the watch was idle at return, False on timeout.
++    """
++    if timeout is None or timeout <= 0:
++        return not is_watch_running(watch_uuid)
++
++    deadline = time.time() + float(timeout)
++    while True:
++        if not is_watch_running(watch_uuid):
++            return True
++        if time.time() >= deadline:
++            return not is_watch_running(watch_uuid)
++        time.sleep(poll_interval)
++
++
+ def is_watch_running_by_another_worker(watch_uuid, current_worker_id):
+     """Check if a specific watch is currently being processed by a different worker"""
+     with _uuid_processing_lock:
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 00000000..7ca8b2b6
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,8 @@
++dgtlmoon-changedetection.io-e9eba1a4-4810-4854-852d-08a574945acb
++Rubric ID：1｜状态：通过｜期望行为：无活动检查时各入口删除历史与附属结果并保留 Watch、处理器配置、暂停和调度。｜实际观察：clear_watch 保留 watch.json 和处理器 JSON，删除历史文件并保留 paused 等配置；重复清理测试通过。｜直接证据：changedetectionio/model/Watch.py:411-530；python -m unittest changedetectionio.tests.unit.test_history_boundary 为 Ran 12 tests、OK。
++Rubric ID：2｜状态：未通过｜期望行为：清空前领取的 worker 不得写回任何旧检查结果。｜实际观察：text_json_diff._apply_diff_filtering 调用 save_last_text_fetched_before_filters 时未传 check_epoch，可控调用在清空后创建 last-fetched.br。｜直接证据：changedetectionio/processors/text_json_diff/processor.py:670-684；对抗输出 P1_UNTAGGED_STALE_FETCH_FILE_EXISTS True。｜原因：text_json_diff 在 worker 检查中调用 save_last_text_fetched_before_filters 时未传 check_epoch，清空后旧检查仍写入 last-fetched.br｜影响：清空后的监控目录仍包含清空前检查生成的抓取文本。｜证据位置：processor.py:684；Watch.py:1417-1422。
++Rubric ID：3｜状态：通过｜期望行为：边界前通知不发送，边界后通知继续发送。｜实际观察：通知入队、队列写入和最终 runner 均校验 watch_history_epoch，边界单元测试验证旧通知拒绝且新通知入队。｜直接证据：notification_service.py:395-516；queue_handlers.py:454-524；flask_app.py:1621-1632；test_history_boundary.py:158-197。
++Rubric ID：4｜状态：未通过｜期望行为：清空后首个新检查应保留，旧任务释放不得污染新任务。｜实际观察：在 boundary commit 返回后写入 epoch 1 新快照，再继续 clear_watch，函数扫描目录并删除该新快照，最终 history_n 为 0。｜直接证据：对抗输出 P1_POST_BOUNDARY_CREATED True、P1_POST_BOUNDARY_HISTORY_SURVIVED 0 False。｜原因：clear_watch 在持久化新 epoch 后才扫描并删除目录，边界后检查在扫描前创建的首个新快照被同次清理删除｜影响：正常调度产生的首个边界后快照可被正在完成的清理删除。｜证据位置：changedetectionio/model/Watch.py:496-518。
++Rubric ID：5｜状态：通过｜期望行为：提交、文件删除或收敛失败返回明确失败并可重试。｜实际观察：commit 异常返回 error 且不删文件，删除错误进入 file_errors，各 UI/API/全局入口显示或记录问题。｜直接证据：Watch.py:496-529；api/Watch.py:309-327；blueprint/ui/__init__.py:205-223；clear_history_job.py:283-296。
++Rubric ID：6｜状态：未通过｜期望行为：全局任务部分失败或重启后安全续跑且不删除边界后新历史。｜实际观察：单项第一次返回 cleared epoch 2 后若 resume 标记仍为 pending，边界后新历史写入后再次处理同一项，第二次返回 cleared epoch 3 且 history_n 为 0。｜直接证据：对抗输出 P1_LOST_MARKER_RETRY cleared 2 cleared 3 history_n 0。｜原因：单项清理完成后若任务状态写入失败，该项仍保持 pending，恢复重试会再次递增 epoch 并删除第一次边界后建立的新历史｜影响：任务状态写入失败或进程在两步之间退出会删除第一次清理之后的新历史。｜证据位置：clear_history_job.py:247-269；Watch.py:477-529。
++Rubric ID：7｜状态：未通过｜期望行为：重复或并发清空具有确定边界，迟到清理不越过新边界。｜实际观察：clear_watch 的删除循环没有清理令牌、目标 epoch 或边界前文件清单；可控交错中较早调用在 epoch 1 文件创建后删除该文件。｜直接证据：P1_POST_BOUNDARY_HISTORY_SURVIVED 0 False；Watch.py:504-518。｜原因：clear_watch 缺少清理所有权或目标清单代际，较早清理在较新边界后扫描目录时会删除较新检查创建的历史文件｜影响：迟到清理和重试能够删除较新检查已经建立的历史。｜证据位置：changedetectionio/model/Watch.py:477-529。
+diff --git a/evidence/screenshots/01-rubric-comparison.png b/evidence/screenshots/01-rubric-comparison.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8d17d925dd5f7578742ec2e04c7333b132a9ef9
+GIT binary patch
+literal 52599
+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
+XJqdgE^!NV;{t5pR@(bR<uP^>DJ<^Y%
+
+literal 0
+HcmV?d00001
+
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 00000000..ac48d5a6
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,22 @@
++rubrics:
++- id: 1
++  type: p2p
++  text: 没有排队或运行检查时，单个 UI、列表批量、REST DELETE、处理器切换和全局清理仍删除历史、截图与抓取结果，并保留 Watch、处理器专用配置、暂停和调度设置。
++- id: 2
++  type: f2p
++  text: 清空开始前已经领取任务的 worker 即使迟到完成，也不能把快照、history、截图、抓取 HTML、错误状态或检查计数写回清空后的监控。
++- id: 3
++  type: f2p
++  text: 清空边界建立前已经排队但尚未发送的变更通知不得在边界后发出，而边界后新检查产生的通知仍按现有设置发送。
++- id: 4
++  type: f2p
++  text: 清空成功后只由正常调度产生边界后的首个新检查，旧任务的释放或取消不会释放、取消或污染新任务，新的首个快照语义正确。
++- id: 5
++  type: f2p
++  text: 文件删除、Watch 提交或运行任务收敛失败时，入口或后台任务记录明确失败并可重试，不会把半清状态报告为成功。
++- id: 6
++  type: f2p
++  text: 全局后台清理在部分监控失败、线程退出或进程重启后能够继续或安全重试，不删除边界之后的新历史，也不会永久保持运行中状态。
++- id: 7
++  type: f2p
++  text: 重复或并发清空具有确定的边界和所有权，迟到清理不能越过较新的清空边界或删除已经由新检查建立的历史。

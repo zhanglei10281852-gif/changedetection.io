@@ -303,9 +303,29 @@ class WatchHistory(Resource):
         if not self.datastore.data['watching'].get(uuid):
             abort(404, message='No watch exists with the UUID of {}'.format(uuid))
 
-        # Same call as the UI "Clear history" button - wipes snapshots/screenshots and
-        # resets last_checked etc, while preserving the watch and its processor config
-        self.datastore.clear_watch_history(uuid)
+        # Same chokepoint as every other clear entry point (UI button, bulk list
+        # action, processor switch, global clear-all job): one history boundary,
+        # same gating of in-flight checks and queued notifications.
+        result = self.datastore.clear_watch_history(uuid)
+
+        if result.get('error'):
+            # Boundary could not be made durable - nothing was deleted; the caller
+            # can safely retry.
+            return {'status': 'error', 'message': result['error']}, 500
+
+        warnings = []
+        if not result.get('converged', True):
+            warnings.append('An in-flight check did not converge before the timeout; '
+                            'its results were discarded by the history boundary.')
+        if result.get('file_errors'):
+            warnings.append('Some history files could not be deleted: {}'
+                            .format('; '.join(result['file_errors'])))
+
+        if warnings:
+            # Boundary committed and durable; only cleanup side effects had trouble.
+            return {'status': 'warning', 'epoch': result.get('epoch'),
+                    'warnings': warnings}, 200
+
         return 'OK', 204
 
 

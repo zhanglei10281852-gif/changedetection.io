@@ -80,10 +80,25 @@ def _handle_operations(op, uuids, datastore, worker_pool, update_q, queuedWatchM
         result_message = gettext("{} watches errors cleared").format(len(uuids))
 
     elif (op == 'clear-history'):
+        cleared_n = 0
+        failed_n = 0
         for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.clear_watch_history(uuid)
-        result_message = gettext("{} watches cleared/reset.").format(len(uuids))
+            if not datastore.data['watching'].get(uuid):
+                continue
+            result = datastore.clear_watch_history(uuid)
+            if result.get('ok'):
+                cleared_n += 1
+            else:
+                failed_n += 1
+                logger.error(f"Bulk clear-history failed for {uuid}: "
+                             f"{result.get('error') or result.get('file_errors')}")
+        if failed_n:
+            result_message = gettext(
+                "{} watches cleared/reset, {} failed (see logs/diagnostics)."
+            ).format(cleared_n, failed_n)
+            result_type = 'error'
+        else:
+            result_message = gettext("{} watches cleared/reset.").format(cleared_n)
 
     elif (op == 'notification-default'):
         from changedetectionio.notification import (
@@ -182,49 +197,65 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool, 
     # Import the login decorator
     from changedetectionio.auth_decorator import login_optionally_required
 
+    def _flash_clear_result(result):
+        """Surface the diagnosable per-watch clear result to the admin."""
+        if result.get('error'):
+            flash(gettext("Could not clear history: {}").format(result['error']), 'error')
+            return
+        problems = list(result.get('file_errors') or [])
+        if not result.get('converged', True):
+            problems.append(gettext('an in-flight check did not finish before the timeout; '
+                                    'its results were discarded by the history boundary'))
+        if problems:
+            flash(gettext("History cleared, but {} problem(s) occurred: {}").format(
+                len(problems), '; '.join(problems[:5])), 'notice')
+        else:
+            flash(gettext("Cleared snapshot history for watch {}").format(result.get('uuid')))
+
     @ui_blueprint.route("/clear_history/<uuid_str:uuid>", methods=['POST'])
     @login_optionally_required
     def clear_watch_history(uuid):
         try:
-            datastore.clear_watch_history(uuid)
+            result = datastore.clear_watch_history(uuid)
         except KeyError:
             flash(gettext('Watch not found'), 'error')
         else:
-            flash(gettext("Cleared snapshot history for watch {}").format(uuid))
+            _flash_clear_result(result)
         return redirect(url_for('watchlist.index'))
 
     @ui_blueprint.route("/clear_history", methods=['GET', 'POST'])
     @login_optionally_required
     def clear_all_history():
+        job_manager = datastore.get_clear_history_job_manager()
+
         if request.method == 'POST':
             confirmtext = request.form.get('confirmtext', '')
 
             if confirmtext.strip().lower() == gettext('clear').strip().lower():
-                # Run in background thread to avoid blocking
-                def clear_history_background():
-                    # Capture UUIDs first to avoid race conditions
-                    watch_uuids = list(datastore.data['watching'].keys())
-                    logger.info(f"Background: Clearing history for {len(watch_uuids)} watches")
-
-                    for uuid in watch_uuids:
-                        try:
-                            datastore.clear_watch_history(uuid)
-                        except Exception as e:
-                            logger.error(f"Error clearing history for watch {uuid}: {e}")
-
-                    logger.info("Background: Completed clearing history")
-
-                # Start daemon thread
-                threading.Thread(target=clear_history_background, daemon=True).start()
-
-                flash(gettext("History clearing started in background"))
+                # Persistent, resumable background job - survives partial failures
+                # and process restarts, and never re-clears watches that already
+                # got their boundary (so post-clear first snapshots survive).
+                action, state = job_manager.start_or_resume()
+                total = (state or {}).get('total', 0)
+                if action == 'already_running':
+                    flash(gettext("History clearing is already running in the background"), 'notice')
+                elif action == 'resumed':
+                    flash(gettext("Resumed history clearing for the remaining watches"))
+                else:
+                    flash(gettext("History clearing started in background for {} watches").format(total))
             else:
                 flash(gettext('Incorrect confirmation text.'), 'error')
 
-            return redirect(url_for('watchlist.index'))
+            return redirect(url_for('ui.clear_all_history'))
 
-        output = render_template("clear_all_history.html")
+        output = render_template("clear_all_history.html", job=job_manager.status())
         return output
+
+    @ui_blueprint.route("/clear_history/status", methods=['GET'])
+    @login_optionally_required
+    def clear_all_history_status():
+        from flask import jsonify
+        return jsonify(datastore.get_clear_history_job_manager().status())
 
     # Clear all statuses, so we do not see the 'unviewed' class
     @ui_blueprint.route("/form/mark-all-viewed", methods=['POST'])

@@ -14,6 +14,25 @@ import time
 from changedetectionio.notification import default_notification_format, valid_notification_formats
 
 
+def _watch_check_is_stale(watch, check_epoch):
+    """Boundary check that is safe for duck-typed/mock watch objects.
+
+    check_epoch=None means a non-check notification (manual/test) and is never
+    stale. The method is looked up on the watch's TYPE so MagicMock-style test
+    doubles (whose arbitrary attributes are truthy auto-mocks) don't read as
+    stale.
+    """
+    if check_epoch is None or watch is None:
+        return False
+    fn = getattr(type(watch), 'check_result_is_stale', None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(watch, check_epoch))
+    except Exception:
+        return False
+
+
 def _check_cascading_vars(datastore, var_name, watch):
     """
     Check notification variables in cascading priority:
@@ -373,14 +392,24 @@ class NotificationService:
         self.datastore = datastore
         self.notification_q = notification_q
     
-    def queue_notification_for_watch(self, n_object: NotificationContextData, watch, date_index_from=-2, date_index_to=-1):
+    def queue_notification_for_watch(self, n_object: NotificationContextData, watch, date_index_from=-2, date_index_to=-1, check_epoch=None):
         """
         Queue a notification for a watch with full diff rendering and template variables
+
+        check_epoch stamps the notification with the history generation of the check
+        that produced it, so an already-queued notification is dropped (at enqueue
+        time and again in the notification runner) when the watch history was cleared
+        after the notification was produced. None = manual/test notification, never
+        filtered by a history boundary.
         """
         from changedetectionio.notification import USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH
 
         if not isinstance(n_object, NotificationContextData):
             raise TypeError(f"Expected NotificationContextData, got {type(n_object)}")
+
+        if _watch_check_is_stale(watch, check_epoch):
+            logger.debug(f"Not queueing notification for {watch.get('uuid')}: check epoch {check_epoch} crossed a history boundary")
+            return False
 
         dates = []
         trigger_text = ''
@@ -423,6 +452,11 @@ class NotificationService:
                                                     triggered_text=triggered_text,
                                                     timestamp_changed=dates[date_index_to]))
 
+        if check_epoch is not None:
+            # Boundary tag checked again by NotificationQueue.put and by the
+            # notification runner immediately before delivery.
+            n_object['watch_history_epoch'] = int(check_epoch)
+
         if self.notification_q:
             logger.debug("Queued notification for sending")
             self.notification_q.put(n_object)
@@ -430,14 +464,21 @@ class NotificationService:
             logger.debug("Not queued, no queue defined. Just returning processed data")
             return n_object
 
-    def send_content_changed_notification(self, watch_uuid):
+        return True
+
+    def send_content_changed_notification(self, watch_uuid, check_epoch=None):
         """
         Send notification when content changes are detected
         """
         n_object = NotificationContextData()
         watch = self.datastore.data['watching'].get(watch_uuid)
         if not watch:
-            return
+            return False
+
+        # History cleared while the triggering check was running
+        if _watch_check_is_stale(watch, check_epoch):
+            logger.debug(f"Not sending change notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
+            return False
 
         watch_history = watch.history
         dates = list(watch_history.keys())
@@ -468,20 +509,26 @@ class NotificationService:
             queued = True
 
             count = watch.get('notification_alert_count', 0) + 1
-            self.datastore.update_watch(uuid=watch_uuid, update_obj={'notification_alert_count': count})
+            self.datastore.update_watch(uuid=watch_uuid,
+                                        update_obj={'notification_alert_count': count},
+                                        check_epoch=check_epoch)
 
-            self.queue_notification_for_watch(n_object=n_object, watch=watch)
+            self.queue_notification_for_watch(n_object=n_object, watch=watch, check_epoch=check_epoch)
 
         return queued
 
-    def send_filter_failure_notification(self, watch_uuid):
+    def send_filter_failure_notification(self, watch_uuid, check_epoch=None):
         """
         Send notification when CSS/XPath filters fail consecutively
         """
         threshold = self.datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts')
         watch = self.datastore.data['watching'].get(watch_uuid)
         if not watch:
-            return
+            return False
+
+        if _watch_check_is_stale(watch, check_epoch):
+            logger.debug(f"Not sending filter failure notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
+            return False
 
         filter_list = ", ".join(watch['include_filters'])
         # @todo - This could be a markdown template on the disk, apprise will convert the markdown to HTML+Plaintext parts in the email, and then 'markup_text_links_to_html_links' is not needed
@@ -515,20 +562,28 @@ Thanks - Your omniscient changedetection.io installation.
                 'watch_url': watch['url'],
                 'watch_open_url': watch.open_link_override or watch['url'],
                 'uuid': watch_uuid,
+                'watch_history_epoch': int(check_epoch) if check_epoch is not None else None,
                 'screenshot': None
             })
             self.notification_q.put(n_object)
             logger.debug(f"Sent filter not found notification for {watch_uuid}")
+            return True
         else:
             logger.debug(f"NOT sending filter not found notification for {watch_uuid} - no notification URLs")
+            return False
 
-    def send_step_failure_notification(self, watch_uuid, step_n):
+    def send_step_failure_notification(self, watch_uuid, step_n, check_epoch=None):
         """
         Send notification when browser steps fail consecutively
         """
         watch = self.datastore.data['watching'].get(watch_uuid, False)
         if not watch:
-            return
+            return False
+
+        if _watch_check_is_stale(watch, check_epoch):
+            logger.debug(f"Not sending step failure notification for {watch_uuid}: pre-boundary check epoch {check_epoch}")
+            return False
+
         threshold = self.datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts')
 
         step = step_n
@@ -564,10 +619,13 @@ Thanks - Your omniscient changedetection.io installation.
             n_object.update({
                 'watch_url': watch['url'],
                 'watch_open_url': watch.open_link_override or watch['url'],
-                'uuid': watch_uuid
+                'uuid': watch_uuid,
+                'watch_history_epoch': int(check_epoch) if check_epoch is not None else None
             })
             self.notification_q.put(n_object)
             logger.error(f"Sent step not found notification for {watch_uuid}")
+            return True
+        return False
 
 
 # Convenience functions for creating notification service instances

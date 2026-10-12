@@ -215,6 +215,11 @@ class fetcher(Fetcher):
                 self.proxy['password'] = parsed.password
 
     async def screenshot_step(self, step_n=''):
+        # History boundary: a check that was cleared mid-run must not leave
+        # step screenshots behind in the new history generation.
+        if not self.check_generation_is_current():
+            logger.debug(f"Skipping step screenshot for stale check generation (step {step_n})")
+            return
         super().screenshot_step(step_n=step_n)
         watch_uuid = getattr(self, 'watch_uuid', None)
         screenshot = await capture_full_page_async(page=self.page, screenshot_format=self.screenshot_format, watch_uuid=watch_uuid, lock_viewport_elements=self.lock_viewport_elements)
@@ -233,6 +238,9 @@ class fetcher(Fetcher):
             gc.collect()
 
     async def save_step_html(self, step_n):
+        if not self.check_generation_is_current():
+            logger.debug(f"Skipping step HTML save for stale check generation (step {step_n})")
+            return
         super().save_step_html(step_n=step_n)
         content = await self.page.content()
 

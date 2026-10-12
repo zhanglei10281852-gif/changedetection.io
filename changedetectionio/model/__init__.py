@@ -642,27 +642,37 @@ class watch_base(dict):
         """
         raise NotImplementedError("Subclass must implement _save_to_disk()")
 
-    def commit(self):
+    def commit(self, raise_on_error=False):
         """
         Save this watch/tag immediately to disk using atomic write.
 
         Common commit logic for Watch and Tag objects.
         Subclasses override _get_commit_data() and _save_to_disk() for specifics.
 
-        Fire-and-forget: Logs errors but does not raise exceptions.
+        Fire-and-forget by default: logs errors but does not raise exceptions.
         Data remains in memory even if save fails, so next commit will retry.
+
+        Pass raise_on_error=True when the caller must know whether the write hit
+        disk durably (e.g. the history-clear boundary commit, where deleting files
+        against an unpersisted boundary would be unsafe).
         """
         from loguru import logger
 
         if not self.data_dir:
             entity_type = self.__class__.__name__
-            logger.error(f"Cannot commit {entity_type} {self.get('uuid')} without datastore_path")
+            msg = f"Cannot commit {entity_type} {self.get('uuid')} without datastore_path"
+            logger.error(msg)
+            if raise_on_error:
+                raise RuntimeError(msg)
             return
 
         uuid = self.get('uuid')
         if not uuid:
             entity_type = self.__class__.__name__
-            logger.error(f"Cannot commit {entity_type} without UUID")
+            msg = f"Cannot commit {entity_type} without UUID"
+            logger.error(msg)
+            if raise_on_error:
+                raise RuntimeError(msg)
             return
 
         # Get data from subclass (may filter keys)
@@ -670,7 +680,8 @@ class watch_base(dict):
             data_dict = self._get_commit_data()
         except Exception as e:
             logger.error(f"Failed to prepare commit data for {uuid}: {e}")
-            return
+            if raise_on_error:
+                raise
 
         # Save to disk via subclass implementation
         try:
@@ -681,3 +692,5 @@ class watch_base(dict):
             logger.debug(f"Committed {entity_type} {uuid} to {uuid}/{filename}")
         except Exception as e:
             logger.error(f"Failed to commit {uuid}: {e}")
+            if raise_on_error:
+                raise

@@ -80,6 +80,11 @@ class Fetcher():
     browser_connection_url = None
     browser_steps = None
     browser_steps_screenshot_path = None
+    # History boundary generation for fetcher-side artifact writes (step_*.jpeg/html).
+    # None = interactive/non-worker fetch, always allowed to write.
+    check_epoch = None
+    datastore_ref = None
+    check_watch_uuid = None
     content = None
     error = None
     fetcher_description = "No description"
@@ -185,6 +190,23 @@ class Fetcher():
     @abstractmethod
     def get_last_status_code(self):
         return self.status_code
+
+    def check_generation_is_current(self):
+        """Whether this fetcher may still write check artifacts to disk.
+
+        False when the fetcher belongs to a worker check whose generation was
+        superseded by a history clear mid-fetch. Non-worker fetches
+        (check_epoch is None) are always current.
+        """
+        if self.check_epoch is None:
+            return True
+        ds = self.datastore_ref
+        if not ds or not self.check_watch_uuid:
+            return True
+        watch = ds.data['watching'].get(self.check_watch_uuid)
+        if watch is None:
+            return True
+        return not watch.check_result_is_stale(self.check_epoch)
 
     @abstractmethod
     def screenshot_step(self, step_n):

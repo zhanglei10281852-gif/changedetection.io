@@ -1513,6 +1513,19 @@ def changedetection_app(config=None, datastore_o=None):
 
     # Skip background threads in batch mode (just process queue and exit)
     batch_mode = app.config.get('batch_mode', False)
+
+    # Recover an interrupted "clear all history" job (process restarted mid-run):
+    # mark it interrupted so it can never show "running" forever, and resume in the
+    # background when the full app is running. Already-cleared watches are recorded
+    # durably and never re-cleared, so post-boundary first snapshots survive. With no
+    # stale job file this is a no-op (incl. fresh test datastores).
+    try:
+        clear_job_manager = datastore.get_clear_history_job_manager()
+        if clear_job_manager.recover_interrupted() and not batch_mode:
+            logger.info("Resuming interrupted clear-all-history background job")
+            clear_job_manager.start_or_resume()
+    except Exception as e:
+        logger.warning(f"Could not recover clear-all-history job state: {e}")
     if not batch_mode:
         # @todo handle ctrl break
         # Supervised: if the ticker ever returns or raises it is logged CRITICAL and
@@ -1604,6 +1617,19 @@ def notification_runner(worker_id=0):
             else:
                 now = datetime.now()
                 sent_obj = None
+
+                # Final history-boundary check: a change notification that was
+                # already queued when an admin cleared the watch's history must
+                # not be delivered after the boundary. Untagged (manual/test)
+                # notifications and notifications for deleted watches pass.
+                _n_epoch = n_object.get('watch_history_epoch')
+                _n_watch = datastore.data['watching'].get(n_object.get('uuid')) if n_object.get('uuid') else None
+                if _n_epoch is not None and _n_watch is not None and int(_n_epoch) != _n_watch.history_epoch:
+                    logger.info(
+                        f"Notification runner dropping pre-clear notification for "
+                        f"{n_object.get('uuid')} (epoch {_n_epoch} != {_n_watch.history_epoch})"
+                    )
+                    continue
 
                 try:
                     from changedetectionio.notification.handler import process_notification

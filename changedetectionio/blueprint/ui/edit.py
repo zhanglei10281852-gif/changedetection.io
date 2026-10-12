@@ -95,9 +95,17 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             for p in processors.available_processors():
                 if p[0] == switch_processor:
                     datastore.data['watching'][uuid]['processor'] = switch_processor
+                    datastore.data['watching'][uuid].commit()
                     flash(gettext("Switched to mode - {}.").format(p[1]))
-                    datastore.clear_watch_history(uuid)
-                    redirect(url_for('ui_edit.edit_page', uuid=uuid))
+                    # Same history-boundary semantics as every other clear entry point
+                    clear_result = datastore.clear_watch_history(uuid)
+                    if clear_result.get('error'):
+                        flash(gettext("History could not be fully cleared after switching mode: {}")
+                              .format(clear_result['error']), 'error')
+                    elif clear_result.get('file_errors') or not clear_result.get('converged', True):
+                        flash(gettext("Mode switched, but history cleanup reported problem(s); "
+                                      "it can safely be retried via Clear history."), 'notice')
+                    return redirect(url_for('ui_edit.edit_page', uuid=uuid))
 
         # be sure we update with a copy instead of accidently editing the live object by reference
         default = None

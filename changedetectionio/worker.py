@@ -29,6 +29,17 @@ IN_PYTEST = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 DEFER_SLEEP_TIME_ALREADY_QUEUED = 0.3 if IN_PYTEST else 10.0
 
 
+class StaleCheckGeneration(Exception):
+    """Raised when the running check finds its history generation was superseded by a clear."""
+
+    def __init__(self, check_epoch, current_epoch):
+        super().__init__(
+            f"Check generation {check_epoch} is stale (history boundary is now {current_epoch})"
+        )
+        self.check_epoch = check_epoch
+        self.current_epoch = current_epoch
+
+
 def set_watch_minitext_status(watch, status):
     """
     Set a transient status line for a watch (e.g. "Fetching...", "Querying AI/LLM..").
@@ -79,6 +90,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
     while not app.config.exit.is_set():
         update_handler = None
         watch = None
+        # History boundary generation captured for THIS claimed check. 0 until a
+        # job is claimed; write-backs tagged with a stale value are dropped.
+        check_epoch = 0
         processing_exception = None  # Reset at start of each iteration to prevent state bleeding
 
         try:
@@ -99,6 +113,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 deferred_item = PrioritizedItem(priority=deferred_priority, item=queued_item_data.item)
                 worker_pool.queue_item_async_safe(q, deferred_item, silent=True)
                 continue
+
+            # Capture the history boundary generation the moment the check is
+            # claimed. If an admin clears this watch's history while we are
+            # fetching ("Checking now..."), the epoch moves and every result
+            # write-back below (state, snapshots, screenshots, fetched pages,
+            # error artifacts, notifications) is discarded as pre-boundary.
+            # A check claimed AFTER the clear sees the new epoch and is allowed.
+            _claimed_watch = datastore.data['watching'].get(uuid)
+            check_epoch = _claimed_watch.history_epoch if _claimed_watch is not None else 0
 
         except asyncio.TimeoutError:
             # No jobs available - check if we should restart based on time while idle
@@ -157,6 +180,11 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                 watch = datastore.data['watching'].get(uuid)
 
+                # All state write-backs from this check go through this so a
+                # history clear mid-check can discard them wholesale.
+                def update_watch_guarded(update_obj_arg):
+                    datastore.update_watch(uuid=uuid, update_obj=update_obj_arg, check_epoch=check_epoch)
+
                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
 
                 try:
@@ -181,8 +209,20 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                                                          watch_uuid=uuid,
                                                                          worker_id=worker_id)
 
+                    # Boundary generation for this claimed check - gates the
+                    # handler's own writes (raw-content checksum, browser-step
+                    # screenshots) even when plugins wrap the handler below.
+                    try:
+                        update_handler.check_epoch = check_epoch
+                    except Exception:
+                        pass
+
                     # Allow plugins to modify/wrap the update_handler
                     update_handler = apply_update_handler_alter(update_handler, watch, datastore)
+                    try:
+                        update_handler.check_epoch = check_epoch
+                    except Exception:
+                        pass
 
                     set_watch_minitext_status(watch, "Fetching...")
 
@@ -205,12 +245,12 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                 except ProcessorException as e:
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot)
+                        watch.save_screenshot(screenshot=e.screenshot, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
                     if e.xpath_data:
-                        watch.save_xpath_data(data=e.xpath_data)
+                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
                         e.xpath_data = None  # Free memory immediately
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': e.message})
+                    update_watch_guarded({'last_error': e.message})
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.ReplyWithContentButNoText as e:
@@ -223,18 +263,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         else:
                             extra_help = ", it's possible that the filters were found, but contained no usable text."
 
-                    datastore.update_watch(uuid=uuid, update_obj={
+                    update_watch_guarded({
                         'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}"
                     })
 
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
 
                     if e.xpath_data:
-                        watch.save_xpath_data(data=e.xpath_data)
+                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
                         e.xpath_data = None  # Free memory immediately
-                        
+
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.Non200ErrorCodeReceived as e:
@@ -251,15 +291,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         err_text = f"Error - Request returned a HTTP error code {e.status_code}{extra}"
 
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
                     if e.xpath_data:
-                        watch.save_xpath_data(data=e.xpath_data, as_error=True)
+                        watch.save_xpath_data(data=e.xpath_data, as_error=True, check_epoch=check_epoch)
                         e.xpath_data = None  # Free memory immediately
                     if e.page_text:
-                        watch.save_error_text(contents=e.page_text)
+                        watch.save_error_text(contents=e.page_text, check_epoch=check_epoch)
 
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    update_watch_guarded({'last_error': err_text})
                     process_changedetection_results = False
 
                 except FilterNotFoundInResponse as e:
@@ -268,15 +308,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     logger.debug(f"Received FilterNotFoundInResponse exception for {uuid}")
 
                     err_text = "Warning, no filters were found, no change detection ran - Did the page change layout? update your Visual Filter if necessary."
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    update_watch_guarded({'last_error': err_text})
 
                     # Filter wasnt found, but we should still update the visual selector so that they can have a chance to set it up again
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot)
+                        watch.save_screenshot(screenshot=e.screenshot, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
 
                     if e.xpath_data:
-                        watch.save_xpath_data(data=e.xpath_data)
+                        watch.save_xpath_data(data=e.xpath_data, check_epoch=check_epoch)
                         e.xpath_data = None  # Free memory immediately
 
                     # Only when enabled, send the notification
@@ -287,15 +327,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         threshold = datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts', 0)
                         logger.debug(f"FilterNotFoundInResponse - Filter for {uuid} not found, consecutive_filter_failures: {c} of threshold {threshold}")
                         if c >= threshold:
-                            if not watch.get('notification_muted'):
+                            if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
                                 logger.debug(f"FilterNotFoundInResponse - Sending filter failed notification for {uuid}")
-                                await send_filter_failure_notification(uuid, notification_q, datastore)
+                                await send_filter_failure_notification(uuid, notification_q, datastore, check_epoch=check_epoch)
                             c = 0
                             logger.debug(f"FilterNotFoundInResponse - Reset filter failure count back to zero")
                         else:
                             logger.debug(f"FilterNotFoundInResponse - {c} of threshold {threshold}..")
 
-                        datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
+                        update_watch_guarded({'consecutive_filter_failures': c})
                     else:
                         logger.trace(f"FilterNotFoundInResponse - {uuid} - filter_failure_notification_send not enabled, skipping")
 
@@ -309,17 +349,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     # Reset the edited flag since we successfully completed the check
                     watch.reset_watch_edited_flag()
                     # Page was fetched successfully - clear any previous error state
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': False})
-                    cleanup_error_artifacts(uuid, datastore)
-                    
+                    update_watch_guarded({'last_error': False})
+                    cleanup_error_artifacts(uuid, datastore, check_epoch=check_epoch)
+
                 except content_fetchers_exceptions.BrowserConnectError as e:
-                    datastore.update_watch(uuid=uuid,
-                                         update_obj={'last_error': e.msg})
+                    update_watch_guarded({'last_error': e.msg})
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.BrowserFetchTimedOut as e:
-                    datastore.update_watch(uuid=uuid,
-                                         update_obj={'last_error': e.msg})
+                    update_watch_guarded({'last_error': e.msg})
                     process_changedetection_results = False
                     
                 except content_fetchers_exceptions.BrowserStepsStepException as e:
@@ -341,8 +379,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                     logger.debug(f"BrowserSteps exception at step {error_step} {str(e.original_e)}")
 
-                    datastore.update_watch(uuid=uuid,
-                                         update_obj={'last_error': err_text,
+                    update_watch_guarded({'last_error': err_text,
                                                    'browser_steps_last_error_step': error_step})
 
                     if watch.get('filter_failure_notification_send', False):
@@ -352,53 +389,56 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         threshold = datastore.data['settings']['application'].get('filter_failure_notification_threshold_attempts', 0)
                         logger.error(f"Step for {uuid} not found, consecutive_filter_failures: {c}")
                         if threshold > 0 and c >= threshold:
-                            if not watch.get('notification_muted'):
-                                await send_step_failure_notification(watch_uuid=uuid, step_n=e.step_n, notification_q=notification_q, datastore=datastore)
+                            if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
+                                await send_step_failure_notification(watch_uuid=uuid, step_n=e.step_n,
+                                                                     notification_q=notification_q,
+                                                                     datastore=datastore,
+                                                                     check_epoch=check_epoch)
                             c = 0
 
-                        datastore.update_watch(uuid=uuid, update_obj={'consecutive_filter_failures': c})
+                        update_watch_guarded({'consecutive_filter_failures': c})
 
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.EmptyReply as e:
                     # Some kind of custom to-str handler in the exception handler that does this?
                     err_text = "EmptyReply - try increasing 'Wait seconds before extracting text', Status Code {}".format(e.status_code)
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                    update_watch_guarded({'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.ScreenshotUnavailable as e:
                     err_text = "Screenshot unavailable, page did not render fully in the expected time or page was too long - try increasing 'Wait seconds before extracting text'"
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                    update_watch_guarded({'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.JSActionExceptions as e:
                     err_text = "Error running JS Actions - Page request - "+e.message
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                    update_watch_guarded({'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.PageUnloadable as e:
                     err_text = "Page request from server didnt respond correctly"
                     if e.message:
                         err_text = "{} - {}".format(err_text, e.message)
 
                     if e.screenshot:
-                        watch.save_screenshot(screenshot=e.screenshot, as_error=True)
+                        watch.save_screenshot(screenshot=e.screenshot, as_error=True, check_epoch=check_epoch)
                         e.screenshot = None  # Free memory immediately
 
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
+                    update_watch_guarded({'last_error': err_text,
                                                                 'last_check_status': e.status_code,
                                                                 'has_ldjson_price_data': None})
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.BrowserStepsInUnsupportedFetcher as e:
                     err_text = "This watch has Browser Steps configured and so it cannot run with the 'Basic fast Plaintext/HTTP Client', either remove the Browser Steps or select a Chrome fetcher."
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    update_watch_guarded({'last_error': err_text})
                     process_changedetection_results = False
                     logger.error(f"Exception (BrowserStepsInUnsupportedFetcher) reached processing watch UUID: {uuid}")
 
@@ -406,7 +446,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     import traceback
                     logger.error(f"Worker {worker_id} exception processing watch UUID: {uuid}")
                     logger.exception(f"Worker {worker_id} full exception details:")
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
+                    update_watch_guarded({'last_error': "Exception: " + str(e)})
                     process_changedetection_results = False
 
                 else:
@@ -419,7 +459,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         update_obj['consecutive_filter_failures'] = 0
 
                     update_obj['last_error'] = False
-                    cleanup_error_artifacts(uuid, datastore)
+                    cleanup_error_artifacts(uuid, datastore, check_epoch=check_epoch)
 
                 if not datastore.data['watching'].get(uuid):
                     continue
@@ -427,6 +467,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 logger.debug(f"Processing watch UUID: {uuid} - xpath_data length returned {len(update_handler.xpath_data) if update_handler and update_handler.xpath_data else 'empty.'}")
                 if update_handler and process_changedetection_results:
                     try:
+                        # History was cleared while this check was fetching: none of its
+                        # results may cross the boundary. Model/store-level guards would
+                        # drop the individual writes anyway, but jump out here to avoid
+                        # wasted LLM/diff work and to never queue an old notification.
+                        if watch.check_result_is_stale(check_epoch):
+                            raise StaleCheckGeneration(check_epoch, watch.history_epoch)
+
                         # Reset the edited flag BEFORE update_watch (which calls watch.update() and would set it again)
                         watch.reset_watch_edited_flag()
 
@@ -532,18 +579,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                             except Exception as e:
                                 logger.warning(f"LLM evaluation error for {uuid}: {e}")
 
-                        datastore.update_watch(uuid=uuid, update_obj=update_obj)
+                        datastore.update_watch(uuid=uuid, update_obj=update_obj, check_epoch=check_epoch)
 
                         if changed_detected or not watch.history_n:
                             if update_handler.screenshot:
-                                watch.save_screenshot(screenshot=update_handler.screenshot)
+                                watch.save_screenshot(screenshot=update_handler.screenshot, check_epoch=check_epoch)
                                 # Free screenshot memory immediately after saving
                                 update_handler.screenshot = None
                                 if hasattr(update_handler, 'fetcher') and hasattr(update_handler.fetcher, 'screenshot'):
                                     update_handler.fetcher.screenshot = None
 
                             if update_handler.xpath_data:
-                                watch.save_xpath_data(data=update_handler.xpath_data)
+                                watch.save_xpath_data(data=update_handler.xpath_data, check_epoch=check_epoch)
                                 # Free xpath data memory
                                 update_handler.xpath_data = None
                                 if hasattr(update_handler, 'fetcher') and hasattr(update_handler.fetcher, 'xpath_data'):
@@ -557,7 +604,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                             watch.save_history_blob(contents=contents,
                                                     timestamp=int(fetch_start_time),
-                                                    snapshot_id=update_obj.get('previous_md5', 'none'))
+                                                    snapshot_id=update_obj.get('previous_md5', 'none'),
+                                                    check_epoch=check_epoch)
 
                             # Save AI summary file now that the new snapshot is committed —
                             # watch.history.keys()[-1] now reflects the just-saved version,
@@ -584,29 +632,43 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                         _llm_from_version,
                                         _llm_to_version,
                                         prompt=_llm_cache_prompt,
+                                        check_epoch=check_epoch,
                                     )
                                 except Exception as _fe:
                                     logger.warning(f"Could not write change-summary file for {uuid}: {_fe}")
 
                             empty_pages_are_a_change = datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
                             if update_handler.fetcher.content or (not update_handler.fetcher.content and empty_pages_are_a_change):
-                                watch.save_last_fetched_html(contents=update_handler.fetcher.content, timestamp=int(fetch_start_time))
+                                watch.save_last_fetched_html(contents=update_handler.fetcher.content,
+                                                             timestamp=int(fetch_start_time),
+                                                             check_epoch=check_epoch)
 
                             # Explicitly delete large content variables to free memory IMMEDIATELY after saving
                             # These are no longer needed after being saved to history
                             del contents
 
-                            # Send notifications on second+ check
+                            # Send notifications on second+ check (the notification queue
+                            # and runner independently re-verify the epoch, so a change
+                            # notification queued just before the clear is dropped too)
                             if watch.history_n >= 2:
                                 logger.info(f"Change detected in UUID {uuid} - {watch['url']}")
-                                if not watch.get('notification_muted'):
-                                    await send_content_changed_notification(uuid, notification_q, datastore)
+                                if not watch.get('notification_muted') and not watch.check_result_is_stale(check_epoch):
+                                    await send_content_changed_notification(uuid, notification_q, datastore,
+                                                                            check_epoch=check_epoch)
+
+                    except StaleCheckGeneration:
+                        # History cleared mid-check - every write-back is epoch-gated;
+                        # just skip the rest of this generation's result processing.
+                        logger.info(
+                            f"Worker {worker_id} skipping result processing for {uuid}: "
+                            f"check epoch {check_epoch} superseded by history boundary {watch.history_epoch}"
+                        )
 
                     except Exception as e:
 
                         logger.critical(f"Worker {worker_id} exception in process_changedetection_results")
                         logger.exception(f"Worker {worker_id} full exception details:")
-                        datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)})
+                        datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)}, check_epoch=check_epoch)
 
 
                 # Always record attempt count
@@ -641,10 +703,11 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     if update_handler.fetcher.favicon_blob and update_handler.fetcher.favicon_blob.get('base64'):
                         watch.bump_favicon(url=update_handler.fetcher.favicon_blob.get('url'),
                                            favicon_base_64=update_handler.fetcher.favicon_blob.get('base64'),
-                                           mime_type=update_handler.fetcher.favicon_blob.get('mime_type')
+                                           mime_type=update_handler.fetcher.favicon_blob.get('mime_type'),
+                                           check_epoch=check_epoch
                                            )
 
-                    datastore.update_watch(uuid=uuid, update_obj=final_updates)
+                    datastore.update_watch(uuid=uuid, update_obj=final_updates, check_epoch=check_epoch)
 
                     # NOW clear fetcher content - after all processing is complete
                     # This is the last point where we need the fetcher data
@@ -668,7 +731,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
             # Also update the watch with error information
             if datastore and uuid in datastore.data['watching']:
-                datastore.update_watch(uuid=uuid, update_obj={'last_error': f"Worker error: {str(e)}"})
+                datastore.update_watch(uuid=uuid,
+                                       update_obj={'last_error': f"Worker error: {str(e)}"},
+                                       check_epoch=check_epoch)
         
         finally:
             # Always cleanup - this runs whether there was an exception or not
@@ -777,8 +842,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
     return "shutdown"
 
 
-def cleanup_error_artifacts(uuid, datastore):
-    """Helper function to clean up error artifacts"""
+def cleanup_error_artifacts(uuid, datastore, check_epoch=None):
+    """Helper function to clean up error artifacts.
+
+    Tagged with the calling check's generation: when history was cleared while
+    the check was running, on-disk error files belong to the new boundary and
+    must not be removed by this stale check.
+    """
+    watch = datastore.data['watching'].get(uuid) if datastore else None
+    if watch is not None and watch.check_result_is_stale(check_epoch):
+        logger.debug(f"Skipping error-artifact cleanup for {uuid} from a pre-boundary check")
+        return
+
     cleanup_files = ["last-error-screenshot.png", "last-error.txt"]
     for f in cleanup_files:
         full_path = os.path.join(datastore.datastore_path, uuid, f)
@@ -787,40 +862,40 @@ def cleanup_error_artifacts(uuid, datastore):
 
 
 
-async def send_content_changed_notification(watch_uuid, notification_q, datastore):
+async def send_content_changed_notification(watch_uuid, notification_q, datastore, check_epoch=None):
     """Helper function to queue notifications using the new notification service"""
     try:
         from changedetectionio.notification_service import create_notification_service
-        
+
         # Create notification service instance
         notification_service = create_notification_service(datastore, notification_q)
-        
-        notification_service.send_content_changed_notification(watch_uuid)
+
+        notification_service.send_content_changed_notification(watch_uuid, check_epoch=check_epoch)
     except Exception as e:
         logger.error(f"Error sending notification for {watch_uuid}: {e}")
 
 
-async def send_filter_failure_notification(watch_uuid, notification_q, datastore):
+async def send_filter_failure_notification(watch_uuid, notification_q, datastore, check_epoch=None):
     """Helper function to send filter failure notifications using the new notification service"""
     try:
         from changedetectionio.notification_service import create_notification_service
-        
+
         # Create notification service instance
         notification_service = create_notification_service(datastore, notification_q)
-        
-        notification_service.send_filter_failure_notification(watch_uuid)
+
+        notification_service.send_filter_failure_notification(watch_uuid, check_epoch=check_epoch)
     except Exception as e:
         logger.error(f"Error sending filter failure notification for {watch_uuid}: {e}")
 
 
-async def send_step_failure_notification(watch_uuid, step_n, notification_q, datastore):
+async def send_step_failure_notification(watch_uuid, step_n, notification_q, datastore, check_epoch=None):
     """Helper function to send step failure notifications using the new notification service"""
     try:
         from changedetectionio.notification_service import create_notification_service
-        
+
         # Create notification service instance
         notification_service = create_notification_service(datastore, notification_q)
-        
-        notification_service.send_step_failure_notification(watch_uuid, step_n)
+
+        notification_service.send_step_failure_notification(watch_uuid, step_n, check_epoch=check_epoch)
     except Exception as e:
         logger.error(f"Error sending step failure notification for {watch_uuid}: {e}")

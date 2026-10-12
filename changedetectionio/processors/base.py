@@ -23,6 +23,9 @@ class difference_detection_processor():
     screenshot_format = SCREENSHOT_FORMAT_JPEG
     last_raw_content_checksum = None
     worker_id = None
+    # History boundary generation captured by the worker for this check; None for
+    # checks run outside the worker (previews, add-watch preload, tests).
+    check_epoch = None
 
     def __init__(self, datastore, watch_uuid, worker_id=None):
         self.datastore = datastore
@@ -55,6 +58,15 @@ class difference_detection_processor():
 
         watch = self.datastore.data['watching'].get(self.watch_uuid)
         if not watch:
+            return
+
+        # History boundary: never write a raw-content checksum for a check that
+        # was claimed before the watch history was cleared.
+        if watch.check_result_is_stale(self.check_epoch):
+            logger.debug(
+                f"Skipping raw-content checksum write for {self.watch_uuid}: "
+                f"pre-boundary check epoch {self.check_epoch}"
+            )
             return
 
         data_dir = watch.data_dir
@@ -217,6 +229,11 @@ class difference_detection_processor():
         if self.watch.has_browser_steps:
             self.fetcher.browser_steps = browser_steps_get_valid_steps(self.watch.get('browser_steps', []))
             self.fetcher.browser_steps_screenshot_path = os.path.join(self.datastore.datastore_path, self.watch.get('uuid'))
+            # History boundary tag so the fetcher's own step_*.jpeg/html writes
+            # are skipped when a clear happens while the browser steps are running.
+            self.fetcher.check_epoch = self.check_epoch
+            self.fetcher.datastore_ref = self.datastore
+            self.fetcher.check_watch_uuid = self.watch.get('uuid')
 
         # Tweak the base config with the per-watch ones
         from changedetectionio.jinja2_custom import render as jinja_render

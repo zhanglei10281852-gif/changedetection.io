@@ -1,6 +1,38 @@
 {% extends 'base.html' %} {% block content %}
 <div class="edit-form">
   <div class="box-wrap inner">
+    {# Persistent, resumable clear-all job state (null when it has never run) #}
+    {% if job %}
+    <div
+      id="clear-history-job-status"
+      data-status-url="{{ url_for('ui.clear_all_history_status') }}"
+      class="pure-control-group"
+      style="
+        border: 1px solid #ccc;
+        padding: 1em;
+        margin-bottom: 1em;
+        background: #fafafa;
+      "
+    >
+      <strong>{{ _('History clearing job') }}</strong>
+      <div id="clear-history-job-body">
+        <span id="clear-history-job-label">
+          {% if job.status == 'running' %}{{ _('Running') }}{% elif job.status == 'interrupted' %}{{ _('Interrupted (safe to resume)') }}{% elif job.status == 'completed_with_errors' %}{{ _('Completed with errors (safe to retry)') }}{% else %}{{ _('Completed') }}{% endif %}
+        </span>
+        <div id="clear-history-job-progress">
+          {{ job.cleared }} / {{ job.total }}
+          {% if job.gone %} ({{ job.gone }} {{ _('no longer exist') }}){% endif %}
+          {% if job.failed %} · {{ job.failed }} {{ _('failed') }}{% endif %}
+        </div>
+        <ul id="clear-history-job-errors" style="color: #b00">
+          {% for item in job['items'] if item.status == 'failed' %}
+          <li>{{ item.uuid }}: {{ item.error }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+    {% endif %}
+
     <form
       class="pure-form pure-form-stacked"
       action="{{url_for('ui.clear_all_history')}}"
@@ -46,4 +78,53 @@
   </div>
 </div>
 
-{% endblock %}
+{% if job %}
+<script>
+  (function () {
+    var box = document.getElementById('clear-history-job-status');
+    if (!box) return;
+    var url = box.getAttribute('data-status-url');
+
+    function render(state) {
+      if (!state) return;
+      var labelMap = {
+        running: {{ _('Running') | tojson }},
+        interrupted: {{ _('Interrupted (safe to resume)') | tojson }},
+        completed: {{ _('Completed') | tojson }},
+        completed_with_errors: {{ _('Completed with errors (safe to retry)') | tojson }}
+      };
+      document.getElementById('clear-history-job-label').textContent =
+        labelMap[state.status] || state.status;
+      var progress = state.cleared + ' / ' + state.total;
+      if (state.gone) progress += ' (' + state.gone + ' ' + {{ _('no longer exist') | tojson }} + ')';
+      if (state.failed) progress += ' · ' + state.failed + ' ' + {{ _('failed') | tojson }};
+      document.getElementById('clear-history-job-progress').textContent = progress;
+      var ul = document.getElementById('clear-history-job-errors');
+      ul.innerHTML = '';
+      (state.items || []).forEach(function (item) {
+        if (item.status === 'failed') {
+          var li = document.createElement('li');
+          li.textContent = item.uuid + ': ' + (item.error || '');
+          ul.appendChild(li);
+        }
+      });
+    }
+
+    function poll() {
+      fetch(url, { headers: { 'X-Requested-With': 'fetch' } })
+        .then(function (r) { return r.json(); })
+        .then(function (state) {
+          render(state);
+          if (state && (state.status === 'running' || (state.status === 'interrupted' && state.thread_alive))) {
+            setTimeout(poll, 2000);
+          }
+        })
+        .catch(function () {});
+    }
+
+    if ({{ 'true' if job.status == 'running' else 'false' }}) {
+      setTimeout(poll, 2000);
+    }
+  })();
+</script>
+{% endif %} {% endblock %}

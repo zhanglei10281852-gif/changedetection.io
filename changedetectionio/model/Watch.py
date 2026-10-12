@@ -44,6 +44,14 @@ from ..html_tools import TRANSLATE_WHITESPACE_TABLE
 FAVICON_RESAVE_THRESHOLD_SECONDS=86400
 BROTLI_COMPRESS_SIZE_THRESHOLD = int(os.getenv('SNAPSHOT_BROTLI_COMPRESSION_THRESHOLD', 1024*20))
 
+# Persisted monotonic generation counter forming the "history boundary".
+# Incremented durably by every clear_watch() call. A worker check captures the
+# epoch when it is claimed and tags all of its result write-backs with it; writes
+# carrying an epoch that no longer matches the live value belong to a pre-clear
+# generation and are discarded, so old snapshots/screenshots/fetched pages/error
+# states/change notifications can never cross the boundary.
+HISTORY_EPOCH_KEY = 'history_clear_epoch'
+
 # Module-level favicon filename cache: data_dir → basename (or None)
 # Keyed by data_dir so it survives Watch object recreation, deepcopy, and concurrent requests.
 # Invalidated explicitly when the favicon is saved or the watch history is cleared.
@@ -364,30 +372,113 @@ class model(EntityPersistenceMixin, watch_base):
         else:
             return f'history-{processor}.txt'
 
-    def clear_watch(self):
+    @property
+    def history_epoch(self):
+        """Current history boundary generation (0 for watches never cleared)."""
+        try:
+            return int(self.get(HISTORY_EPOCH_KEY, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def result_write_is_stale(check_epoch, current_epoch):
+        """True when a result write tagged with check_epoch predates a history boundary.
+
+        check_epoch=None means "not produced by a claimed worker check" (UI actions,
+        imports, tests, notification test sends) - such writes are always allowed.
+        """
+        if check_epoch is None:
+            return False
+        try:
+            return int(check_epoch) != int(current_epoch)
+        except (TypeError, ValueError):
+            return False
+
+    def check_result_is_stale(self, check_epoch):
+        """Whether write-backs from check_epoch belong to an older history generation."""
+        return self.result_write_is_stale(check_epoch, self.history_epoch)
+
+    def _drop_stale_check_write(self, check_epoch, what):
+        """Log helper used by the gated save_* methods; returns True when dropped."""
+        if check_epoch is None or not self.check_result_is_stale(check_epoch):
+            return False
+        logger.info(
+            f"[{self.get('uuid')}] Discarding {what} from pre-boundary check "
+            f"(check epoch {check_epoch}, current epoch {self.history_epoch})"
+        )
+        return True
+
+    def clear_watch(self, wait_for_in_flight=True, convergence_timeout=None):
+        """Establish a durable history boundary and remove all history artifacts.
+
+        Same semantics for every entry point (single UI button, list bulk action,
+        REST DELETE, processor switch, global "clear all history" job):
+
+        1. Bounded convergence with a check that is currently running ("Checking
+           now..."), so file deletion normally runs with no writer alive.
+        2. Bump history_clear_epoch and persist it BEFORE deleting anything. From
+           that instant every check claimed before this call has its write-backs
+           gated (snapshots, screenshots, fetched pages, error state, queued
+           notifications). Only checks claimed after the boundary may create the
+           new first snapshot.
+        3. Enumerate the files to delete AFTER the boundary and delete only those
+           exact paths, so files created by a genuine post-boundary first check
+           can never be removed by a retry. Processor config files are preserved;
+           the watch itself, pause and schedule settings are untouched.
+
+        Returns a diagnosable result dict and never raises for file/convergence
+        problems. A failed boundary persistence is reported as ok=False with
+        everything left in place (state retained) so the operation can be safely
+        retried without ever deleting post-boundary history.
+        """
         import pathlib
 
-        # Get list of processor config files to preserve
         from changedetectionio.processors import find_processors
         processor_names = [name for cls, name in find_processors()]
         processor_config_files = {f"{name}.json" for name in processor_names}
+        # The watch entity file (watch.json) is configuration + the durable
+        # boundary epoch, never history: keep it. (The old code deleted it and
+        # relied on a follow-up commit to recreate the file; keeping it makes the
+        # boundary commit authoritative and avoids the delete/recreate race.)
+        from changedetectionio.model.persistence import _determine_entity_type
+        processor_config_files.add(f"{_determine_entity_type(self.__class__)}.json")
 
-        # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
-        # But preserve processor config files (they're configuration, not history data)
-        # Use glob not rglob here for safety.
-        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
-            # Skip processor config files
-            if item.name in processor_config_files:
-                continue
-            os.unlink(item)
+        result = {
+            'ok': False,
+            'uuid': self.get('uuid'),
+            'epoch_before': self.history_epoch,
+            'epoch': self.history_epoch,
+            'converged': True,
+            'file_errors': [],
+            'error': None,
+        }
 
-        _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
+        # 1) Bounded convergence with an in-flight check. The epoch guard below is
+        #    the authoritative backstop when the wait times out; convergence only
+        #    removes the tiny file-deletion race window.
+        if wait_for_in_flight:
+            try:
+                from changedetectionio import worker_pool
+                if convergence_timeout is None:
+                    convergence_timeout = float(os.getenv('CLEAR_HISTORY_CONVERGE_TIMEOUT', '30'))
+                result['converged'] = worker_pool.wait_for_watch_idle(
+                    self.get('uuid'), timeout=convergence_timeout
+                )
+                if not result['converged']:
+                    logger.warning(
+                        f"[{self.get('uuid')}] History clear: in-flight check did not converge within "
+                        f"{convergence_timeout}s - proceeding on the epoch boundary guard"
+                    )
+            except Exception as e:
+                # Worker pool unavailable (unit tests, standalone use) - the epoch
+                # guard alone keeps the boundary safe.
+                logger.debug(f"History clear: in-flight convergence check skipped: {e}")
 
-        # Force the attr to recalculate
-        bump = self.history
-
-        # Do this last because it will trigger a recheck due to last_checked being zero
+        # 2) Durable boundary: bump epoch + reset live check state BEFORE unlinking.
+        #    Do this last-ish relative to scheduling (last_checked=0 makes the
+        #    ticker queue a fresh, post-boundary check).
         self.update({
+            HISTORY_EPOCH_KEY: self.history_epoch + 1,
             'browser_steps_last_error_step': None,
             'check_count': 0,
             'fetch_time': 0.0,
@@ -400,11 +491,44 @@ class model(EntityPersistenceMixin, watch_base):
             'remote_server_reply': None,
             'track_ldjson_price_data': None
         })
+        result['epoch'] = self.history_epoch
+
+        try:
+            self.commit(raise_on_error=True)
+        except Exception as e:
+            # No durable boundary -> do not touch files; leave everything retryable.
+            result['error'] = f"History boundary could not be persisted for watch {self.get('uuid')}: {e}"
+            logger.error(result['error'])
+            return result
+
+        # 3) Enumerate after the boundary; delete only exact enumerated paths.
+        #    JSON data, screenshots, text snapshots, fetched HTML etc - but keep
+        #    processor config files (configuration, not history data).
+        #    glob (not rglob) confines this to the watch's own data directory.
+        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
+            if item.name in processor_config_files:
+                continue
+            try:
+                os.unlink(item)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                msg = f"{item.name}: {e}"
+                result['file_errors'].append(msg)
+                logger.error(f"[{self.get('uuid')}] History clear could not delete {msg}")
+
+        _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
+
+        # Force the cached history index attrs to recalculate against the empty dir
+        bump = self.history
+
         watch_check_update = signal('watch_check_update')
         if watch_check_update:
             watch_check_update.send(watch_uuid=self.get('uuid'))
 
-        return
+        result['ok'] = not result['file_errors']
+        return result
+
 
     @property
     def is_source_type_url(self):
@@ -706,7 +830,11 @@ class model(EntityPersistenceMixin, watch_base):
 
     # Save some text file to the appropriate path and bump the history
     # result_obj from fetch_site_status.run()
-    def save_history_blob(self, contents, timestamp, snapshot_id):
+    def save_history_blob(self, contents, timestamp, snapshot_id, check_epoch=None):
+        # History boundary: a snapshot produced by a check claimed before the
+        # last clear must never become the new first snapshot.
+        if self._drop_stale_check_write(check_epoch, f"snapshot {snapshot_id}"):
+            return None
 
         logger.trace(f"{self.get('uuid')} - Updating {self.history_index_filename} with timestamp {timestamp}")
 
@@ -862,7 +990,9 @@ class model(EntityPersistenceMixin, watch_base):
         # Also in the case that the file didnt exist
         return True
 
-    def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None) -> None:
+    def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None, check_epoch=None) -> None:
+        if self._drop_stale_check_write(check_epoch, "favicon"):
+            return None
         from urllib.parse import urlparse
         import base64
         import binascii
@@ -1086,8 +1216,10 @@ class model(EntityPersistenceMixin, watch_base):
             logger.debug(f"LLM cached diff summary '{fname}' FOUND")
             return f.read().strip()
 
-    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = ''):
+    def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = '', check_epoch=None):
         """Persist the AI Change Summary keyed by version pair + prompt hash."""
+        if self._drop_stale_check_write(check_epoch, f"LLM summary {from_version}->{to_version}"):
+            return
         self.ensure_data_dir_exists()
         prompt_hash = self._llm_summary_prompt_hash(prompt)
         fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
@@ -1221,13 +1353,17 @@ class model(EntityPersistenceMixin, watch_base):
         # None is set
         return False
 
-    def save_error_text(self, contents):
+    def save_error_text(self, contents, check_epoch=None):
+        if self._drop_stale_check_write(check_epoch, "error text"):
+            return
         self.ensure_data_dir_exists()
         target_path = os.path.join(self.data_dir, "last-error.txt")
         with open(target_path, 'w', encoding='utf-8') as f:
             f.write(contents)
 
-    def save_xpath_data(self, data, as_error=False):
+    def save_xpath_data(self, data, as_error=False, check_epoch=None):
+        if self._drop_stale_check_write(check_epoch, "xpath data"):
+            return
         import json
         import zlib
 
@@ -1246,7 +1382,10 @@ class model(EntityPersistenceMixin, watch_base):
             f.close()
 
     # Save as PNG, PNG is larger but better for doing visual diff in the future
-    def save_screenshot(self, screenshot: bytes, as_error=False):
+    def save_screenshot(self, screenshot: bytes, as_error=False, check_epoch=None):
+        if self._drop_stale_check_write(
+                check_epoch, "error screenshot" if as_error else "screenshot"):
+            return
 
         if as_error:
             target_path = os.path.join(self.data_dir, "last-error-screenshot.png")
@@ -1275,12 +1414,16 @@ class model(EntityPersistenceMixin, watch_base):
         with open(filepath, 'rb') as f:
             return(brotli.decompress(f.read()).decode('utf-8'))
 
-    def save_last_text_fetched_before_filters(self, contents):
+    def save_last_text_fetched_before_filters(self, contents, check_epoch=None):
+        if self._drop_stale_check_write(check_epoch, "last fetched text"):
+            return
         import brotli
         filepath = os.path.join(self.data_dir, 'last-fetched.br')
         _brotli_save(contents, filepath, mode=brotli.MODE_TEXT, fallback_uncompressed=False)
 
-    def save_last_fetched_html(self, timestamp, contents):
+    def save_last_fetched_html(self, timestamp, contents, check_epoch=None):
+        if self._drop_stale_check_write(check_epoch, f"fetched HTML {timestamp}"):
+            return
         self.ensure_data_dir_exists()
         snapshot_fname = f"{timestamp}.html.br"
         filepath = os.path.join(self.data_dir, snapshot_fname)

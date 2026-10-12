@@ -450,11 +450,40 @@ class NotificationQueue:
     def set_datastore(self, datastore):
         """Set datastore reference after initialization (for circular dependency handling)"""
         self.datastore = datastore
-    
+
+    def _item_crossed_history_boundary(self, item: Dict[str, Any]):
+        """True when a watch-tagged notification belongs to a pre-clear history generation.
+
+        Items without an epoch tag (manual/test notifications, global digests)
+        are never filtered here.
+        """
+        if not (self.datastore and isinstance(item, dict)):
+            return False
+        item_epoch = item.get('watch_history_epoch')
+        watch_uuid = item.get('uuid')
+        if item_epoch is None or not watch_uuid:
+            return False
+        watch = self.datastore.data['watching'].get(watch_uuid)
+        if watch is None:
+            return False
+        try:
+            return int(item_epoch) != watch.history_epoch
+        except (TypeError, ValueError):
+            return False
+
     def put(self, item: Dict[str, Any], block: bool = True, timeout: Optional[float] = None):
         """Thread-safe sync put with signal emission"""
         logger.trace(f"NotificationQueue.put() called for item: {item.get('uuid', 'unknown')}, block={block}, timeout={timeout}")
         try:
+            # Drop change notifications produced by checks from before a history clear
+            if self._item_crossed_history_boundary(item):
+                logger.info(
+                    f"Notification blocked - history boundary crossed for watch "
+                    f"{item.get('uuid')} (item epoch {item.get('watch_history_epoch')}, "
+                    f"current epoch {self.datastore.data['watching'].get(item.get('uuid')).history_epoch})"
+                )
+                return False
+
             # Check if all notifications are muted
             if self.datastore and self.datastore.data['settings']['application'].get('all_muted', False):
                 logger.debug(f"Notification blocked - all notifications are muted: {item.get('uuid', 'unknown')}")
@@ -479,6 +508,11 @@ class NotificationQueue:
         logger.trace(f"NotificationQueue.async_put() called for item: {item.get('uuid', 'unknown')}, executor={executor}")
         import asyncio
         try:
+            # Drop pre-clear-generation notifications
+            if self._item_crossed_history_boundary(item):
+                logger.debug(f"Notification blocked - history boundary crossed: {item.get('uuid', 'unknown')}")
+                return False
+
             # Check if all notifications are muted
             if self.datastore and self.datastore.data['settings']['application'].get('all_muted', False):
                 logger.debug(f"Notification blocked - all notifications are muted: {item.get('uuid', 'unknown')}")

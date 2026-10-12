@@ -104,9 +104,14 @@ class Watch(BaseWatch):
         self['restock'] = Restock(kw['default']['restock']) if kw.get('default') and kw['default'].get('restock') else Restock()
 
 
-    def clear_watch(self):
-        super().clear_watch()
+    def clear_watch(self, wait_for_in_flight=True, convergence_timeout=None):
+        # Same history-boundary contract as the base Watch; additionally reset the
+        # restock-specific runtime state and persist it with the boundary.
+        result = super().clear_watch(wait_for_in_flight=wait_for_in_flight,
+                                     convergence_timeout=convergence_timeout)
         self.update({'restock': Restock()})
+        self.commit()
+        return result
 
     def extra_notification_token_values(self):
         values = super().extra_notification_token_values()

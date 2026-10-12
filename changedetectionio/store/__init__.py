@@ -552,10 +552,21 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
         except Exception as e:
             logger.error(f"Failed to commit settings: {e}")
 
-    def update_watch(self, uuid, update_obj):
+    def update_watch(self, uuid, update_obj, check_epoch=None):
 
         # It's possible that the watch could be deleted before update
-        if not self.__data['watching'].get(uuid):
+        watch = self.__data['watching'].get(uuid)
+        if not watch:
+            return
+
+        # History boundary: drop state write-backs from a check claimed before
+        # the watch history was cleared. The first check scheduled AFTER the
+        # boundary carries the new epoch and is never affected.
+        if Watch.model.result_write_is_stale(check_epoch, watch.history_epoch):
+            logger.debug(
+                f"Discarding state update for {uuid} from pre-boundary check "
+                f"(check epoch {check_epoch}, current epoch {watch.history_epoch})"
+            )
             return
 
         with self.lock:
@@ -678,9 +689,29 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
         return False
 
     # Remove a watchs data but keep the entry (URL etc)
-    def clear_watch_history(self, uuid):
-        self.__data['watching'][uuid].clear_watch()
-        self.__data['watching'][uuid].commit()
+    def clear_watch_history(self, uuid, wait_for_in_flight=True, convergence_timeout=None):
+        """Establish a history boundary for one watch and wipe pre-boundary data.
+
+        Single chokepoint used by every entry point (UI button, bulk list action,
+        REST DELETE, processor switch, the global clear-all background job) so
+        they all share the same boundary semantics.
+
+        Returns the diagnosable result dict produced by Watch.clear_watch():
+        {'ok', 'uuid', 'epoch', 'converged', 'file_errors', 'error'}.
+        """
+        return self.__data['watching'][uuid].clear_watch(
+            wait_for_in_flight=wait_for_in_flight,
+            convergence_timeout=convergence_timeout,
+        )
+
+    def get_clear_history_job_manager(self):
+        """Lazy singleton managing the persistent, resumable clear-all job."""
+        manager = getattr(self, '_clear_history_job_manager', None)
+        if manager is None:
+            from ..clear_history_job import ClearAllHistoryJobManager
+            manager = ClearAllHistoryJobManager(self)
+            self._clear_history_job_manager = manager
+        return manager
 
     @property
     def watch_limit(self):
