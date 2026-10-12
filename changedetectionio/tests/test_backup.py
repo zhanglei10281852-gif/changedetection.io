@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 
-from .util import set_original_response, live_server_setup, wait_for_all_checks
-from flask import url_for
 import io
-from zipfile import ZipFile, ZIP_DEFLATED
+import json
+import os
 import re
 import time
-from changedetectionio.model import Watch, Tag
+from zipfile import ZipFile, ZIP_DEFLATED
+
+from flask import url_for
+
+from changedetectionio.model import Tag, Watch
+
+from .util import live_server_setup, set_original_response, wait_for_all_checks
 
 
 def test_backup(client, live_server, measure_memory_usage, datastore_path):
@@ -261,6 +266,182 @@ def test_backup_restore_zip_bomb_rejected(client, live_server, measure_memory_us
         restore_mod._MAX_DECOMPRESSED_BYTES = original_limit
 
 
+class _FakeWatch(dict):
+    """Minimal stand-in for a Watch.model object: data_dir + dict access."""
+    def __init__(self, data_dir, **kw):
+        super().__init__(**kw)
+        self.data_dir = data_dir
+
+
+def _write_json(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+
+
+def test_backup_rejects_torn_history_and_retries(tmp_path):
+    """An index referencing a snapshot that vanished (trim/half commit) must not
+    be published; the candidate is removed and the next request succeeds."""
+    import pytest
+
+    from changedetectionio.blueprint.backups import BackupBuildError, create_backup
+
+    datastore_dir = str(tmp_path)
+    uuid = "11111111-1111-4111-8111-111111111111"
+    watch_dir = os.path.join(datastore_dir, uuid)
+    os.makedirs(watch_dir)
+    snapshot_name = "abcdef.txt"
+
+    _write_json(os.path.join(watch_dir, "watch.json"), {
+        "uuid": uuid,
+        "url": "https://example.com/",
+        "processor": "text_json_diff",
+        "last_checked": 1700000000,
+        "tags": [],
+    })
+    # Index points at a snapshot that is not on disk (trimmed mid-backup/raced)
+    with open(os.path.join(watch_dir, "history.txt"), "w", encoding="utf-8") as f:
+        f.write(f"1700000000,{snapshot_name}\n")
+
+    watches = {uuid: _FakeWatch(watch_dir, url="https://example.com/", tags=[])}
+
+    with pytest.raises(BackupBuildError):
+        create_backup(datastore_path=datastore_dir, watches=watches, tags={})
+
+    # No published archive, no candidate leftovers
+    assert not [n for n in os.listdir(datastore_dir) if n.endswith(".zip")]
+    assert not [n for n in os.listdir(datastore_dir) if n.startswith(".backup-candidate-")]
+
+    # The check boundary becomes complete (snapshot appears): retry succeeds
+    with open(os.path.join(watch_dir, snapshot_name), "w", encoding="utf-8") as f:
+        f.write("snapshot body")
+    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags={})
+    assert os.path.isfile(backup_path)
+
+    with ZipFile(backup_path) as zf:
+        names = set(zf.namelist())
+        assert f"{uuid}/watch.json" in names
+        assert f"{uuid}/history.txt" in names
+        assert f"{uuid}/{snapshot_name}" in names
+
+
+def test_backup_cleans_stale_candidates_but_keeps_completed_backups(tmp_path):
+    """Interrupted candidates are removed; already published *.zip backups survive."""
+    from changedetectionio.blueprint.backups import CANDIDATE_DIR_PREFIX, create_backup
+
+    datastore_dir = str(tmp_path)
+
+    old_backup = os.path.join(datastore_dir, "changedetection-backup-20000101000000.zip")
+    with ZipFile(old_backup, "w") as zf:
+        zf.writestr("changedetection.json", "{}")
+
+    # New-scheme candidate directory (process died while building)
+    dead_dir = os.path.join(datastore_dir, CANDIDATE_DIR_PREFIX + "1234-deadbeef")
+    os.makedirs(dead_dir)
+    with open(os.path.join(dead_dir, "half.zip"), "w") as f:
+        f.write("partial")
+    # Old-scheme leftover
+    with open(os.path.join(datastore_dir, "changedetection-backup-20000101010101.tmp"), "w") as f:
+        f.write("legacy partial")
+
+    # Empty instance (no watch dirs) - background creation must still work
+    create_backup(datastore_path=datastore_dir, watches={}, tags={})
+
+    assert os.path.isfile(old_backup), "a completed old backup must remain downloadable"
+    leftovers = [n for n in os.listdir(datastore_dir)
+                 if n.startswith(CANDIDATE_DIR_PREFIX) or n.endswith(".tmp")]
+    assert leftovers == [], f"unfinished candidates must be cleaned: {leftovers}"
+    published = [n for n in os.listdir(datastore_dir)
+                 if n.startswith("changedetection-backup-") and n.endswith(".zip")]
+    assert len(published) == 2
+
+
+def test_backup_is_a_consistent_watch_boundary(tmp_path):
+    """All files of one watch land in the archive; scratch files never do; the
+    URL list only references the archived watch."""
+    from changedetectionio.blueprint.backups import create_backup
+
+    datastore_dir = str(tmp_path)
+    uuid = "22222222-2222-4222-a222-222222222222"
+    tag_uuid = "33333333-3333-4333-b333-333333333333"
+    watch_dir = os.path.join(datastore_dir, uuid)
+    tag_dir = os.path.join(datastore_dir, tag_uuid)
+    os.makedirs(watch_dir)
+    os.makedirs(tag_dir)
+
+    _write_json(os.path.join(datastore_dir, "changedetection.json"), {
+        "settings": {"application": {"tags": {}}}
+    })
+    _write_json(os.path.join(watch_dir, "watch.json"), {
+        "uuid": uuid,
+        "url": "https://example.com/űrlap?x=ő",
+        "processor": "restock_diff",
+        "last_checked": 1700000005,
+        "tags": [tag_uuid],
+    })
+    _write_json(os.path.join(watch_dir, "restock_diff.json"), {"in_stock_only": True})
+    with open(os.path.join(watch_dir, "history-restock_diff.txt"), "w", encoding="utf-8") as f:
+        f.write("1700000005,snap-5.txt.br\n")
+    with open(os.path.join(watch_dir, "snap-5.txt.br"), "wb") as f:
+        f.write(b"compressed-snapshot")
+    # Writer scratch files must never enter the archive
+    with open(os.path.join(watch_dir, "tmpXYZ"), "w") as f:
+        f.write("scratch")
+    with open(os.path.join(watch_dir, "json-xyz.tmp"), "w") as f:
+        f.write("scratch")
+    _write_json(os.path.join(tag_dir, "tag.json"), {"uuid": tag_uuid, "title": "Gruppe 🏷️"})
+
+    watches = {uuid: _FakeWatch(watch_dir,
+                                url="https://example.com/űrlap?x=ő",
+                                tags=[tag_uuid])}
+    tags = {tag_uuid: _FakeWatch(tag_dir, title="Gruppe 🏷️")}
+
+    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags=tags)
+    with ZipFile(backup_path) as zf:
+        names = set(zf.namelist())
+
+    assert f"{uuid}/watch.json" in names
+    assert f"{uuid}/restock_diff.json" in names
+    assert f"{uuid}/history-restock_diff.txt" in names
+    assert f"{uuid}/snap-5.txt.br" in names
+    assert f"{tag_uuid}/tag.json" in names
+    assert "changedetection.json" in names
+    assert f"{uuid}/tmpXYZ" not in names
+    assert f"{uuid}/json-xyz.tmp" not in names
+    assert "secret.txt" not in names
+
+    with ZipFile(backup_path) as zf:
+        assert "example.com/űrlap" in zf.read("url-list.txt").decode("utf-8")
+        assert tag_uuid in zf.read("url-list-with-tags.txt").decode("utf-8")
+
+
+def test_backup_watch_without_committed_watch_json_deferred(tmp_path):
+    """A half-created watch directory (no watch.json yet) waits for the next
+    archive instead of being published as a partial entry."""
+    from changedetectionio.blueprint.backups import create_backup
+
+    datastore_dir = str(tmp_path)
+    uuid = "44444444-4444-4444-8444-444444444444"
+    watch_dir = os.path.join(datastore_dir, uuid)
+    os.makedirs(watch_dir)
+    with open(os.path.join(watch_dir, "last-screenshot.png"), "wb") as f:
+        f.write(b"\x89PNG-fake")
+
+    watches = {uuid: _FakeWatch(watch_dir, url="https://example.com/new", tags=[])}
+    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags={})
+
+    with ZipFile(backup_path) as zf:
+        names = set(zf.namelist())
+    assert f"{uuid}/last-screenshot.png" not in names
+    assert f"{uuid}/watch.json" not in names
+    # The URL list must not reference a watch missing from the archive
+    assert "https://example.com/new" not in zf_read(backup_path, "url-list.txt")
+
+
+def zf_read(zip_path, member):
+    with ZipFile(zip_path) as zf:
+        return zf.read(member).decode("utf-8")
+
+
 def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
     """Test create_backup handles extended UTF-8 characters in URLs and tags without encoding errors (issue #1805)."""
     import os
@@ -269,21 +450,42 @@ def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
 
     from changedetectionio.blueprint.backups import create_backup
 
+    utf8_url = "https://example.com/products/café-öl-日本語-🎉?query=test#section"
+    utf8_tag_titles = ["Größe", "日本語タグ", "🏷️special"]
+    tag_uuids = [
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "aaaaaaaa-0000-4000-8000-000000000002",
+        "aaaaaaaa-0000-4000-8000-000000000003",
+    ]
+
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # A committed watch boundary: its own data directory with watch.json
+        watch_data_dir = os.path.join(tmp_dir, "test-uuid-1")
+        os.makedirs(watch_data_dir)
+        with open(os.path.join(watch_data_dir, "watch.json"), "w", encoding="utf-8") as f:
+            json.dump({"uuid": "test-uuid-1", "url": utf8_url, "tags": tag_uuids}, f)
+
         watch_mock = MagicMock()
-        watch_mock.data_dir = tmp_dir
-        watch_mock.__getitem__.side_effect = lambda key: (
-            "https://example.com/products/café-öl-日本語-🎉?query=test#section" if key == "url" else None
-        )
+        watch_mock.data_dir = watch_data_dir
+        watch_mock.__getitem__.side_effect = lambda key: utf8_url if key == "url" else None
         watch_mock.get.side_effect = lambda key, default=None: (
-            "https://example.com/products/café-öl-日本語-🎉?query=test#section"
-            if key == "url"
-            else (["Größe", "日本語タグ", "🏷️special"] if key == "tags" else default)
+            utf8_url if key == "url" else (tag_uuids if key == "tags" else default)
         )
+
+        tag_mocks = {}
+        for tag_uuid, title in zip(tag_uuids, utf8_tag_titles, strict=True):
+            tag_dir = os.path.join(tmp_dir, tag_uuid)
+            os.makedirs(tag_dir)
+            with open(os.path.join(tag_dir, "tag.json"), "w", encoding="utf-8") as f:
+                json.dump({"uuid": tag_uuid, "title": title}, f, ensure_ascii=False)
+            tag_mock = MagicMock()
+            tag_mock.data_dir = tag_dir
+            tag_mock.get.side_effect = lambda key, default=None, t=title: t if key == "title" else default
+            tag_mocks[tag_uuid] = tag_mock
 
         watches = {"test-uuid-1": watch_mock}
         # Should create backup without UnicodeEncodeError
-        create_backup(datastore_path=tmp_dir, watches=watches, tags={})
+        backup_path = create_backup(datastore_path=tmp_dir, watches=watches, tags=tag_mocks)
 
         url_list_path = os.path.join(tmp_dir, "url-list.txt")
         url_list_tags_path = os.path.join(tmp_dir, "url-list-with-tags.txt")
@@ -298,6 +500,10 @@ def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
         with open(url_list_tags_path, encoding="utf-8") as f:
             content = f.read()
             assert "café-öl-日本語-🎉" in content
-            assert "Größe" in content
-            assert "日本語タグ" in content
-            assert "🏷️special" in content
+            for tag_uuid in tag_uuids:
+                assert tag_uuid in content
+
+        # Group titles (UTF-8) survive into the archive as well
+        with ZipFile(backup_path) as zf:
+            for tag_uuid, title in zip(tag_uuids, utf8_tag_titles, strict=True):
+                assert title in zf.read(f"{tag_uuid}/tag.json").decode("utf-8")

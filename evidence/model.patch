@@ -1,0 +1,1925 @@
+diff --git a/changedetectionio/blueprint/backups/__init__.py b/changedetectionio/blueprint/backups/__init__.py
+index b6b4c751..ccfca351 100644
+--- a/changedetectionio/blueprint/backups/__init__.py
++++ b/changedetectionio/blueprint/backups/__init__.py
+@@ -1,94 +1,608 @@
+ import datetime
+ import glob
++import json
++import os
++import re
++import secrets
++import shutil
+ import threading
++import time
+ 
+-from flask import Blueprint, render_template, send_from_directory, flash, url_for, redirect, abort
++from flask import Blueprint, abort, flash, redirect, render_template, send_from_directory, url_for
+ from flask_babel import gettext
+-import os
++from loguru import logger
+ 
+-from changedetectionio.store import ChangeDetectionStore
+ from changedetectionio.flask_app import login_optionally_required
+-from loguru import logger
++from changedetectionio.store import ChangeDetectionStore
+ 
+ BACKUP_FILENAME_FORMAT = "changedetection-backup-{}.zip"
+ 
+-
+-def create_backup(datastore_path, watches: dict, tags: dict = None):
+-    logger.debug("Creating backup...")
++# A backup is built inside a private candidate directory and only the finished
++# zip is atomically renamed into the datastore root (os.replace). Anything left
++# behind under this prefix (or carrying the old ".tmp" suffix) is therefore an
++# unfinished candidate of a thread/process that died before publishing - it is
++# never a valid download and is safe to remove.
++CANDIDATE_DIR_PREFIX = ".backup-candidate-"
++LEGACY_CANDIDATE_GLOB = "changedetection-backup-*.tmp"
++
++# How often a per-watch "stable read" may fail (files changed while copied)
++# before the whole backup attempt is abandoned instead of publishing a torn
++# archive. Checks completing while we run simply land in the next archive.
++MAX_BUILD_ATTEMPTS = 4
++
++# history.txt for text_json_diff, history-{processor}.txt for the other processors
++_HISTORY_INDEX_RE = re.compile(r'^history(-[A-Za-z0-9_-]+)?\.txt$')
++
++# Scratch files the writers keep inside an entity directory while doing atomic
++# saves (tempfile.mkstemp(prefix='json-', suffix='.tmp'), NamedTemporaryFile()
++# which uses a "tmp..." name, any explicit *.tmp). They are never a committed
++# state and must never enter an archive.
++_SCRATCH_SUFFIX = '.tmp'
++_SCRATCH_PREFIXES = ('tmp', 'json-')
++
++
++class BackupBuildError(Exception):
++    """The archive could not represent a consistent completed state."""
++
++
++class BackupUnstableError(BackupBuildError):
++    """Files changed (or vanished) while being copied - the attempt must be retried."""
++
++
++def _is_scratch_file(name):
++    return name.endswith(_SCRATCH_SUFFIX) or name.startswith(_SCRATCH_PREFIXES)
++
++
++def _scan_entity_files(data_dir):
++    """Return {filename: (inode, size, mtime_ns)} for the regular files of one entity dir.
++
++    The fingerprint tuple lets a later scan prove that nothing in the directory
++    was replaced, appended to, deleted or created while we read it - every
++    writer here commits via os.replace() (new inode/mtime) or an in-place
++    rewrite (size/mtime change), both of which move the fingerprint.
++    """
++    entries = {}
++    try:
++        with os.scandir(data_dir) as it:
++            for de in it:
++                name = de.name
++                if _is_scratch_file(name):
++                    continue
++                fingerprint = _fingerprint_dir_entry(de, data_dir)
++                if fingerprint is not None:
++                    entries[name] = fingerprint
++    except FileNotFoundError as e:
++        raise BackupUnstableError(f"Entity directory {data_dir} disappeared while scanning") from e
++    return entries
++
++
++def _fingerprint_dir_entry(de, data_dir):
++    """(inode, size, mtime_ns) for a regular file entry, None for other types."""
++    try:
++        # Snapshots/configs are always regular files; never follow links.
++        if not de.is_file(follow_symlinks=False):
++            return None
++        st = de.stat(follow_symlinks=False)
++    except FileNotFoundError as e:
++        raise BackupUnstableError(f"{de.name!r} vanished while scanning {data_dir}") from e
++    except OSError as e:
++        raise BackupBuildError(f"Could not stat {de.name!r} in {data_dir}: {e}") from e
++    return st.st_ino, st.st_size, st.st_mtime_ns
++
++
++def _stable_archive_entity(zip_obj, data_dir, arc_prefix, config_filename,
++                           compress_type, compresslevel):
++    """Stream one entity directory into the zip only while it is quiescent.
++
++    scan -> archive -> scan: if the two fingerprints differ, a check/trim/edit
++    was committing while we read and any mixture of old/new files is possible,
++    so the whole backup attempt is retried. Large files (screenshots, snapshot
++    blobs) are streamed straight into the zip; only the small config/history
++    files are buffered so they can be validated.
++
++    Returns (config_meta_or_None, {filename: buffered bytes}, set_of_arcnames).
++    Entities whose config commit has not landed yet (no watch.json/tag.json)
++    return None config and are deferred to the next archive.
++    """
++    before = _scan_entity_files(data_dir)
++
++    # Config missing means the entity commit has not landed - write nothing and
++    # defer the whole entity to the next archive (a retry picks it up once the
++    # watch.json/tag.json appears).
++    if config_filename not in before:
++        return None, {}, set()
++
++    buffered = _archive_entity_files(
++        zip_obj, data_dir, arc_prefix, before, config_filename, compress_type, compresslevel
++    )
++    after = _scan_entity_files(data_dir)
++    if before != after:
++        raise BackupUnstableError(f"{data_dir} changed while being copied")
++
++    arcnames = {f"{arc_prefix}/{name}" for name in before}
++    try:
++        meta = json.loads(buffered[config_filename].decode('utf-8'))
++    except (UnicodeDecodeError, ValueError) as e:
++        raise BackupBuildError(f"{arc_prefix}/{config_filename} is not valid JSON: {e}") from e
++    return meta, buffered, arcnames
++
++
++def _archive_entity_files(zip_obj, data_dir, arc_prefix, manifest, config_filename,
++                          compress_type, compresslevel):
++    """Write all files of one entity (per its manifest) into the open zip."""
++    buffered = {}
++    for name in manifest:
++        arcname = f"{arc_prefix}/{name}"
++        source = os.path.join(data_dir, name)
++        if name == config_filename or _HISTORY_INDEX_RE.match(name):
++            buffered[name] = _read_small_file(source, data_dir)
++            zip_obj.writestr(arcname, buffered[name],
++                             compress_type=compress_type, compresslevel=compresslevel)
++        else:
++            _stream_large_file(zip_obj, source, arcname, data_dir, compress_type, compresslevel)
++    return buffered
++
++
++def _read_small_file(source, data_dir):
++    try:
++        with open(source, 'rb') as f:
++            return f.read()
++    except FileNotFoundError as e:
++        raise BackupUnstableError(f"{os.path.basename(source)!r} disappeared while reading {data_dir}") from e
++    except OSError as e:
++        # A read error must never silently drop the file - fail the candidate.
++        raise BackupBuildError(f"Could not read {os.path.basename(source)!r} from {data_dir}: {e}") from e
++
++
++def _stream_large_file(zip_obj, source, arcname, data_dir, compress_type, compresslevel):
++    try:
++        zip_obj.write(source, arcname=arcname, compress_type=compress_type, compresslevel=compresslevel)
++    except FileNotFoundError as e:
++        raise BackupUnstableError(f"{os.path.basename(source)!r} disappeared while archiving {data_dir}") from e
++    except OSError as e:
++        raise BackupBuildError(f"Could not archive {os.path.basename(source)!r} from {data_dir}: {e}") from e
++
++
++def _stable_read_single_file(filepath):
++    """Read a root config file only while it is not being atomically replaced."""
++    try:
++        st1 = os.stat(filepath)
++        with open(filepath, 'rb') as f:
++            data = f.read()
++        st2 = os.stat(filepath)
++    except FileNotFoundError as e:
++        raise BackupUnstableError(f"{filepath} disappeared while being read") from e
++    except OSError as e:
++        raise BackupBuildError(f"Could not read {filepath}: {e}") from e
++    if (st1.st_ino, st1.st_size, st1.st_mtime_ns) != (st2.st_ino, st2.st_size, st2.st_mtime_ns):
++        raise BackupUnstableError(f"{filepath} changed while being read")
++    return data
++
++
++def _parse_history_index(raw):
++    """Parse a history index ('{epoch},{snapshot filename}' per line).
++
++    Mirrors Watch.history parsing: basename() the referenced file, skip junk
++    lines. Returns [(key, snapshot_basename), ...] in index order.
++    """
++    refs = []
++    for line in raw.decode('utf-8', errors='replace').splitlines():
++        line = line.strip()
++        if not line or ',' not in line:
++            continue
++        key, value = line.split(',', 1)
++        key = key.strip()
++        snapshot = os.path.basename(value.strip())
++        if key and snapshot:
++            refs.append((key, snapshot))
++    return refs
++
++
++def _materialize_mapping(mapping):
++    """Snapshot a live watches/tags dict to [(uuid, obj), ...].
++
++    The passed-in dicts are mutated by worker/UI threads, so a plain
++    list(mapping.items()) can raise mid-iteration; retry briefly instead of
++    publishing an archive built from a half-seen set of entities.
++    """
++    if not mapping:
++        return []
++    last_error = None
++    for _ in range(6):
++        try:
++            return list(mapping.items())
++        except RuntimeError as e:
++            # "dictionary changed size during iteration"
++            last_error = e
++            time.sleep(0.05)
++    raise BackupBuildError(f"Entity set kept changing while taking a snapshot: {last_error}")
++
++
++def cleanup_stale_backup_candidates(datastore_path):
++    """Remove unfinished backup candidates left by a crashed thread/process.
++
++    Finished backups are 'changedetection-backup-<digits>.zip' and are never
++    touched here; only candidate directories (new scheme) and '*.tmp' files
++    (older scheme) are removed. Safe to run at startup and before each backup.
++    """
++    base = os.path.abspath(datastore_path)
++    removed = 0
++    removed += _remove_legacy_candidates(base)
++
++    try:
++        names = os.listdir(base)
++    except OSError as e:
++        logger.error(f"Could not scan {base} for stale backup candidates: {e}")
++        return removed
++
++    for name in names:
++        if name.startswith(CANDIDATE_DIR_PREFIX):
++            removed += _remove_candidate(base, name)
++    return removed
++
++
++def _remove_legacy_candidates(base):
++    removed = 0
++    for legacy in glob.glob(os.path.join(base, LEGACY_CANDIDATE_GLOB)):
++        try:
++            os.unlink(legacy)
++            removed += 1
++            logger.warning(f"Removed unfinished backup candidate {legacy}")
++        except OSError as e:
++            logger.error(f"Could not remove stale backup candidate {legacy}: {e}")
++    return removed
++
++
++def _remove_candidate(base, name):
++    candidate = os.path.realpath(os.path.join(base, name))
++    if os.path.dirname(candidate) != base:
++        return 0
++    try:
++        if os.path.isdir(candidate) and not os.path.islink(candidate):
++            shutil.rmtree(candidate)
++        else:
++            os.unlink(candidate)
++        logger.warning(f"Removed unfinished backup candidate {candidate}")
++        return 1
++    except OSError as e:
++        logger.error(f"Could not remove stale backup candidate {candidate}: {e}")
++        return 0
++
++
++def _build_backup_attempt(datastore_path, watches, tags, final_zip_name, candidate_dir):
++    """One attempt at building a complete, internally consistent archive.
++
++    Raises BackupBuildError/BackupUnstableError on any problem; never publishes
++    on failure. On success the finished zip is atomically renamed into place.
++    """
+     import zipfile
+-    from pathlib import Path
+ 
+-    # create a ZipFile object
+-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+-    backupname = BACKUP_FILENAME_FORMAT.format(timestamp)
+-    backup_filepath = os.path.join(datastore_path, backupname)
++    candidate_zip = os.path.join(candidate_dir, final_zip_name)
++    if os.path.exists(candidate_zip):
++        os.unlink(candidate_zip)
+ 
+-    with zipfile.ZipFile(backup_filepath.replace('.zip', '.tmp'), "w",
++    included_watches = []
++    included_tag_uuids = set()
++    expected_arcnames = set()
++
++    with zipfile.ZipFile(candidate_zip, "w",
+                          compression=zipfile.ZIP_DEFLATED,
+-                         compresslevel=8) as zipObj:
+-
+-        # Add the settings file (supports both formats)
+-        # New format: changedetection.json
+-        changedetection_json = os.path.join(datastore_path, "changedetection.json")
+-        if os.path.isfile(changedetection_json):
+-            zipObj.write(changedetection_json, arcname="changedetection.json")
+-            logger.debug("Added changedetection.json to backup")
+-
+-        # Legacy format: url-watches.json (for backward compatibility)
+-        url_watches_json = os.path.join(datastore_path, "url-watches.json")
+-        if os.path.isfile(url_watches_json):
+-            zipObj.write(url_watches_json, arcname="url-watches.json")
+-            logger.debug("Added url-watches.json to backup")
+-
+-        # Add tag data directories (each tag has its own {uuid}/tag.json)
+-        for uuid, tag in (tags or {}).items():
+-            for f in Path(tag.data_dir).glob('*'):
+-                zipObj.write(f,
+-                             arcname=os.path.join(f.parts[-2], f.parts[-1]),
+-                             compress_type=zipfile.ZIP_DEFLATED,
+-                             compresslevel=8)
+-            logger.debug(f"Added tag '{tag.get('title')}' ({uuid}) to backup")
+-
+-        # Add any data in the watch data directory.
+-        for uuid, w in watches.items():
+-            for f in Path(w.data_dir).glob('*'):
+-                zipObj.write(f,
+-                             # Use the full path to access the file, but make the file 'relative' in the Zip.
+-                             arcname=os.path.join(f.parts[-2], f.parts[-1]),
+-                             compress_type=zipfile.ZIP_DEFLATED,
+-                             compresslevel=8)
+-
+-        # Create a list file with just the URLs, so it's easier to port somewhere else in the future
+-        list_file = "url-list.txt"
+-        with open(os.path.join(datastore_path, list_file), "w", encoding="utf-8") as f:
+-            for uuid in watches:
+-                url = watches[uuid]["url"]
+-                f.write("{}\r\n".format(url))
+-        list_with_tags_file = "url-list-with-tags.txt"
+-        with open(
+-                os.path.join(datastore_path, list_with_tags_file), "w", encoding="utf-8"
+-        ) as f:
+-            for uuid in watches:
+-                url = watches[uuid].get('url')
+-                tag = watches[uuid].get('tags', {})
+-                f.write("{} {}\r\n".format(url, tag))
+-
+-        # Add it to the Zip
+-        zipObj.write(
+-            os.path.join(datastore_path, list_file),
+-            arcname=list_file,
+-            compress_type=zipfile.ZIP_DEFLATED,
+-            compresslevel=8,
++                         compresslevel=8) as zip_obj:
++        settings_data = _archive_root_settings(zip_obj, datastore_path, expected_arcnames)
++        included_tag_uuids.update(
++            _archive_groups(zip_obj, tags, expected_arcnames, zipfile.ZIP_DEFLATED, 8)
++        )
++        included_watches = _archive_watches(
++            zip_obj, watches, expected_arcnames, zipfile.ZIP_DEFLATED, 8
+         )
+-        zipObj.write(
+-            os.path.join(datastore_path, list_with_tags_file),
+-            arcname=list_with_tags_file,
+-            compress_type=zipfile.ZIP_DEFLATED,
+-            compresslevel=8,
++
++        _validate_references(settings_data, included_watches, included_tag_uuids)
++        _write_and_archive_url_lists(zip_obj, datastore_path, included_watches, expected_arcnames)
++
++    _verify_candidate_zip(candidate_zip, expected_arcnames)
++
++    # Atomic publish - same filesystem, single rename. Only now does the
++    # archive become visible for download/'latest'.
++    final_path = os.path.join(datastore_path, final_zip_name)
++    os.replace(candidate_zip, final_path)
++    return final_path
++
++
++def _archive_root_settings(zip_obj, datastore_path, expected_arcnames):
++    """Archive changedetection.json (active settings) and legacy url-watches.json.
++
++    Returns the parsed active settings dict (changedetection.json), or None.
++    The legacy file is a frozen snapshot and is included but not cross-checked.
++    """
++    settings_data = None
++    for root_name in ("changedetection.json", "url-watches.json"):
++        root_path = os.path.join(datastore_path, root_name)
++        if not os.path.isfile(root_path):
++            continue
++        data = _stable_read_single_file(root_path)
++        try:
++            parsed = json.loads(data.decode('utf-8'))
++        except (UnicodeDecodeError, ValueError) as e:
++            raise BackupBuildError(f"{root_name} is not valid JSON, refusing to back it up: {e}") from e
++        if root_name == "changedetection.json":
++            # The current writer always saves tags as {}; anything referenced
++            # here must exist as an archived group (validated below).
++            settings_data = parsed
++        zip_obj.writestr(root_name, data, compress_type=zip_obj.compression, compresslevel=8)
++        expected_arcnames.add(root_name)
++    return settings_data
++
++
++def _archive_groups(zip_obj, tags, expected_arcnames, compress_type, compresslevel):
++    """Archive every committed {uuid}/ tag directory; returns included tag UUIDs."""
++    included = set()
++    for uuid, tag in _materialize_mapping(tags):
++        data_dir = getattr(tag, 'data_dir', None)
++        if not data_dir or not os.path.isdir(data_dir):
++            # Deleted (or never committed) - simply absent from this boundary.
++            continue
++        tag_meta, _buffered, arcnames = _stable_archive_entity(
++            zip_obj, data_dir, uuid, "tag.json", compress_type, compresslevel
+         )
++        if tag_meta is None:
++            # tag.json commit has not landed yet; wait for the next archive.
++            continue
++        expected_arcnames.update(arcnames)
++        included.add(uuid)
++        title = tag_meta.get('title') if isinstance(tag_meta, dict) else uuid
++        logger.debug(f"Added group '{title}' ({uuid}) to backup")
++    return included
++
++
++def _archive_watches(zip_obj, watches, expected_arcnames, compress_type, compresslevel):
++    """Archive every committed {uuid}/ watch directory; returns watch records."""
++    included = []
++    for uuid, watch in _materialize_mapping(watches):
++        data_dir = getattr(watch, 'data_dir', None)
++        if not data_dir or not os.path.isdir(data_dir):
++            # Deleted between the request and the copy - nothing to include.
++            continue
++        watch_meta, buffered, arcnames = _stable_archive_entity(
++            zip_obj, data_dir, uuid, "watch.json", compress_type, compresslevel
++        )
++        if watch_meta is None:
++            # add_watch() creates the directory and in-memory entry just before
++            # committing watch.json; that watch belongs to the next archive,
++            # never a half-created one.
++            logger.debug(f"Watch {uuid} has no committed watch.json yet, deferring to next backup")
++            continue
++        _validate_watch_history(uuid, watch_meta, buffered, arcnames)
++        expected_arcnames.update(arcnames)
++        included.append((uuid, watch_meta, watch))
++    return included
++
++
++def _validate_watch_history(uuid, watch_meta, buffered, arcnames):
++    """History indexes must reference snapshots in the same archive, and the
++    index must belong to the same completed check as watch.json."""
++    processor = watch_meta.get('processor') or 'text_json_diff'
++    primary_index = 'history.txt' if processor == 'text_json_diff' else f'history-{processor}.txt'
++    newest_history_key = None
++    on_disk_names = {arc.split('/', 1)[1] for arc in arcnames}
++    for name, raw in buffered.items():
++        if not _HISTORY_INDEX_RE.match(name):
++            continue
++        refs = _parse_history_index(raw)
++        for _key, snapshot_name in refs:
++            if snapshot_name not in on_disk_names:
++                raise BackupBuildError(
++                    f"{uuid}/{name} references snapshot {snapshot_name!r} which is missing "
++                    f"from the data directory (trimmed, half-written or raced) - refusing to "
++                    f"publish an archive that cannot be restored"
++                )
++        if name == primary_index and refs:
++            newest_history_key = refs[-1][0]
++
++    # Whenever a snapshot was recorded, the check that recorded it also set
++    # last_checked to its fetch timestamp (+1s on a same-second key collision).
++    # A newer index paired with an older watch.json is exactly the torn commit
++    # we must not publish.
++    last_checked = watch_meta.get('last_checked')
++    try:
++        if newest_history_key is not None and last_checked and \
++                int(newest_history_key) > int(last_checked) + 2:
++            raise BackupBuildError(
++                f"Watch {uuid} history index points at {newest_history_key} but "
++                f"watch.json last_checked is {last_checked} - config and history come "
++                f"from different check states"
++            )
++    except (TypeError, ValueError) as e:
++        # Non-numeric values cannot be cross-checked; reference validation still applied.
++        raise BackupBuildError(f"Watch {uuid} has non-numeric history/last_checked values") from e
++
++
++def _validate_references(settings_data, included_watches, included_tag_uuids):
++    """Settings, groups and watches may not reference objects outside the archive."""
++    if isinstance(settings_data, dict):
++        app_settings = (settings_data.get('settings', {}) or {}).get('application', {})
++        settings_tags = app_settings.get('tags') or {}
++        if isinstance(settings_tags, dict):
++            for tag_uuid in settings_tags:
++                if tag_uuid not in included_tag_uuids:
++                    raise BackupBuildError(
++                        f"changedetection.json references group {tag_uuid} which is not part of "
++                        f"the archive"
++                    )
++
++    for uuid, watch_meta, _watch in included_watches:
++        for tag_uuid in (watch_meta.get('tags') or []):
++            if tag_uuid not in included_tag_uuids:
++                raise BackupBuildError(
++                    f"Watch {uuid} references group {tag_uuid} which is not part of the archive"
++                )
++
++
++def _write_and_archive_url_lists(zip_obj, datastore_path, included_watches, expected_arcnames):
++    """Generate url-list files for exactly the watches included in the archive."""
++    list_file = "url-list.txt"
++    list_with_tags_file = "url-list-with-tags.txt"
++    list_lines = []
++    list_with_tags_lines = []
++    for uuid, watch_meta, watch in included_watches:
++        url, tags_value = _watch_url_and_tags(watch_meta, watch)
++        list_lines.append(f"{url}\r\n")
++        list_with_tags_lines.append(f"{url} {tags_value}\r\n")
++
++    list_path = os.path.join(datastore_path, list_file)
++    list_tags_path = os.path.join(datastore_path, list_with_tags_file)
++    with open(list_path, "w", encoding="utf-8") as f:
++        f.writelines(list_lines)
++    with open(list_tags_path, "w", encoding="utf-8") as f:
++        f.writelines(list_with_tags_lines)
++
++    for list_name in (list_file, list_with_tags_file):
++        zip_obj.write(os.path.join(datastore_path, list_name),
++                      arcname=list_name,
++                      compress_type=zip_obj.compression,
++                      compresslevel=8)
++        expected_arcnames.add(list_name)
++
++
++def _watch_url_and_tags(watch_meta, watch):
++    """URL/tags for the URL list - prefer the archived watch.json bytes."""
++    if watch_meta and watch_meta.get('url'):
++        return watch_meta['url'], watch_meta.get('tags', [])
++    # Fallback for unusual layouts (watch.json missing url field)
++    url = (watch.get('url') if hasattr(watch, 'get') else None) or watch['url']
++    tags_value = watch.get('tags', []) if hasattr(watch, 'get') else []
++    return url, tags_value
++
++
++def _verify_candidate_zip(candidate_zip, expected_arcnames):
++    """Reopen the finished zip and confirm every staged entry made it in."""
++    import zipfile
++    with zipfile.ZipFile(candidate_zip, 'r') as check_zip:
++        archived = set(check_zip.namelist())
++    missing = expected_arcnames - archived
++    if missing:
++        raise BackupBuildError(f"Backup archive is missing entries after writing: {sorted(missing)[:10]}")
++
++
++def _unique_backup_name(datastore_path):
++    """Backup filename whose published path does not exist yet (digits only)."""
++    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
++    name = BACKUP_FILENAME_FORMAT.format(timestamp)
++    for _ in range(5):
++        if not os.path.exists(os.path.join(datastore_path, name)):
++            return name
++        # Two backups in the same second would otherwise silently overwrite the
++        # older completed one.
++        time.sleep(1.05)
++        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
++        name = BACKUP_FILENAME_FORMAT.format(timestamp)
++    raise BackupBuildError("Could not allocate a unique backup filename")
++
+ 
+-    # Now it's done, rename it so it shows up finally and its completed being written.
+-    os.rename(backup_filepath.replace('.zip', '.tmp'), backup_filepath.replace('.tmp', '.zip'))
++def create_backup(datastore_path, watches: dict, tags: dict = None):
++    """Build and publish one backup zip representing a complete check boundary.
++
++    Never publishes on failure: the candidate directory is removed and the
++    exception is raised/logged, so requesting another backup works again.
++    Checks that complete while the backup runs are deferred to the next archive.
++    """
++    logger.debug("Creating backup...")
++
++    # A previous thread/process may have died mid-build; reclaim its candidates
++    # (completed *.zip backups are left untouched).
++    cleanup_stale_backup_candidates(datastore_path)
++
++    final_zip_name = _unique_backup_name(datastore_path)
++    candidate_dir = os.path.join(
++        datastore_path,
++        f"{CANDIDATE_DIR_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
++    )
++    os.makedirs(candidate_dir, exist_ok=False)
++
++    try:
++        last_error = _attempt_backup_builds(datastore_path, watches, tags, final_zip_name, candidate_dir)
++        if last_error is not None:
++            logger.error(f"Backup could not be made consistent after {MAX_BUILD_ATTEMPTS} attempts, "
++                         f"no backup was published: {last_error}")
++            raise BackupBuildError(f"Backup abandoned: {last_error}")
++        return os.path.join(datastore_path, final_zip_name)
++    finally:
++        # Candidate directory (and any partial zip inside) must always be gone.
++        shutil.rmtree(candidate_dir, ignore_errors=True)
++
++
++def _attempt_backup_builds(datastore_path, watches, tags, final_zip_name, candidate_dir):
++    last_error = None
++    for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
++        try:
++            final_path = _build_backup_attempt(
++                datastore_path, watches, tags or {}, final_zip_name, candidate_dir
++            )
++            logger.success(f"Backup published: {final_path}")
++            return None
++        except BackupUnstableError as e:
++            last_error = e
++            logger.warning(f"Backup attempt {attempt}/{MAX_BUILD_ATTEMPTS} saw a concurrent write "
++                           f"({e}); retrying with a fresh snapshot")
++            time.sleep(0.05 * attempt)
++        except BackupBuildError as e:
++            last_error = e
++            logger.warning(f"Backup attempt {attempt}/{MAX_BUILD_ATTEMPTS} failed consistency "
++                           f"checks ({e}); retrying")
++            time.sleep(0.05 * attempt)
++    return last_error
++
++
++def run_backup_in_background(datastore_path, watches, tags=None):
++    """Thread entry point: build a backup, never let an exception escape the thread.
++
++    A failed backup has already cleaned its candidate; logging it here is enough
++    (the next request simply starts a fresh, clean build).
++    """
++    try:
++        create_backup(datastore_path, watches, tags=tags)
++    except BackupBuildError as e:
++        logger.error(f"Background backup failed and no backup was published: {e}")
++    except Exception:
++        logger.exception("Background backup failed with an unexpected error and no backup was published")
++
++
++def find_backups(datastore_path):
++    """Published backups (newest first) with filename, size in MB and ctime."""
++    backup_filepath = os.path.join(datastore_path, BACKUP_FILENAME_FORMAT.format("*"))
++    backup_info = []
++    for backup in glob.glob(backup_filepath):
++        size = os.path.getsize(backup) / (1024 * 1024)
++        backup_info.append({
++            'filename': os.path.basename(backup),
++            'filesize': f"{size:.2f}",
++            'creation_time': os.path.getctime(backup)
++        })
++    backup_info.sort(key=lambda x: x['creation_time'], reverse=True)
++    return backup_info
++
++
++def _serve_backup_download(datastore_path, filename):
++    """Validate the requested filename (resolving 'latest') and send the zip."""
++    filename = filename.strip()
++    backup_filename_regex = BACKUP_FILENAME_FORMAT.format(r"\d+")
++
++    # Resolve 'latest' before any validation so checks run against the real name.
++    if filename == 'latest':
++        backups = find_backups(datastore_path)
++        if not backups:
++            abort(404)
++        filename = backups[0]['filename']
++
++    if not re.match(r"^" + backup_filename_regex + "$", filename):
++        abort(400)  # Bad Request if the filename doesn't match the pattern
++
++    base = os.path.abspath(datastore_path)
++    full_path = os.path.join(base, filename)
++    if not full_path.startswith(base + os.sep):
++        abort(404)
++
++    logger.debug(f"Backup download request for '{full_path}'")
++    return send_from_directory(base, filename, as_attachment=True)
+ 
+ 
+ def construct_blueprint(datastore: ChangeDetectionStore):
+@@ -98,20 +612,26 @@ def construct_blueprint(datastore: ChangeDetectionStore):
+     backups_blueprint.register_blueprint(construct_restore_blueprint(datastore))
+     backup_threads = []
+ 
++    # Startup recovery: an interrupted process/thread can never finish its
++    # candidate, so remove leftovers before anyone can request a new backup.
++    # Already completed *.zip backups remain available for download/restore.
++    _cleanup_at_startup(datastore)
++
+     @backups_blueprint.route("/request-backup", methods=['POST'])
+     @login_optionally_required
+     def request_backup():
++        backup_threads[:] = [t for t in backup_threads if t.is_alive()]
+         if any(thread.is_alive() for thread in backup_threads):
+             flash(gettext("A backup is already running, check back in a few minutes"), "error")
+             return redirect(url_for('backups.create'))
+ 
+-        if len(find_backups()) > int(os.getenv("MAX_NUMBER_BACKUPS", 100)):
++        if len(find_backups(datastore.datastore_path)) > int(os.getenv("MAX_NUMBER_BACKUPS", 100)):
+             flash(gettext("Maximum number of backups reached, please remove some"), "error")
+             return redirect(url_for('backups.create'))
+ 
+         # With immediate persistence, all data is already saved
+         zip_thread = threading.Thread(
+-            target=create_backup,
++            target=run_backup_in_background,
+             args=(datastore.datastore_path, datastore.data.get("watching")),
+             kwargs={'tags': datastore.data['settings']['application'].get('tags', {})},
+             daemon=True,
+@@ -123,66 +643,27 @@ def construct_blueprint(datastore: ChangeDetectionStore):
+ 
+         return redirect(url_for('backups.create'))
+ 
+-    def find_backups():
+-        backup_filepath = os.path.join(datastore.datastore_path, BACKUP_FILENAME_FORMAT.format("*"))
+-        backups = glob.glob(backup_filepath)
+-        backup_info = []
+-
+-        for backup in backups:
+-            size = os.path.getsize(backup) / (1024 * 1024)
+-            creation_time = os.path.getctime(backup)
+-            backup_info.append({
+-                'filename': os.path.basename(backup),
+-                'filesize': f"{size:.2f}",
+-                'creation_time': creation_time
+-            })
+-
+-        backup_info.sort(key=lambda x: x['creation_time'], reverse=True)
+-
+-        return backup_info
+-
+     @backups_blueprint.route("/download/<string:filename>", methods=['GET'])
+     @login_optionally_required
+     def download_backup(filename):
+-        import re
+-        filename = filename.strip()
+-        backup_filename_regex = BACKUP_FILENAME_FORMAT.format(r"\d+")
+-
+-        # Resolve 'latest' before any validation so checks run against the real filename.
+-        if filename == 'latest':
+-            backups = find_backups()
+-            if not backups:
+-                abort(404)
+-            filename = backups[0]['filename']
+-
+-        if not re.match(r"^" + backup_filename_regex + "$", filename):
+-            abort(400)  # Bad Request if the filename doesn't match the pattern
+-
+-        full_path = os.path.join(os.path.abspath(datastore.datastore_path), filename)
+-        if not full_path.startswith(os.path.abspath(datastore.datastore_path) + os.sep):
+-            abort(404)
+-
+-        logger.debug(f"Backup download request for '{full_path}'")
+-        return send_from_directory(os.path.abspath(datastore.datastore_path), filename, as_attachment=True)
++        return _serve_backup_download(datastore.datastore_path, filename)
+ 
+     @backups_blueprint.route("/", methods=['GET'])
+     @backups_blueprint.route("/create", methods=['GET'])
+     @login_optionally_required
+     def create():
+-        backups = find_backups()
+-        output = render_template("backup_create.html",
+-                                 available_backups=backups,
+-                                 backup_running=any(thread.is_alive() for thread in backup_threads)
+-                                 )
+-        return output
++        backup_threads[:] = [t for t in backup_threads if t.is_alive()]
++        return render_template(
++            "backup_create.html",
++            available_backups=find_backups(datastore.datastore_path),
++            backup_running=any(thread.is_alive() for thread in backup_threads)
++        )
+ 
+     @backups_blueprint.route("/remove-backups", methods=['POST'])
+     @login_optionally_required
+     def remove_backups():
+-
+-        backup_filepath = os.path.join(datastore.datastore_path, BACKUP_FILENAME_FORMAT.format("*"))
+-        backups = glob.glob(backup_filepath)
+-        for backup in backups:
++        pattern = os.path.join(datastore.datastore_path, BACKUP_FILENAME_FORMAT.format("*"))
++        for backup in glob.glob(pattern):
+             os.unlink(backup)
+ 
+         flash(gettext("Backups were deleted."))
+@@ -190,3 +671,12 @@ def construct_blueprint(datastore: ChangeDetectionStore):
+         return redirect(url_for('backups.create'))
+ 
+     return backups_blueprint
++
++
++def _cleanup_at_startup(datastore):
++    try:
++        removed = cleanup_stale_backup_candidates(datastore.datastore_path)
++        if removed:
++            logger.warning(f"Cleaned up {removed} incomplete backup candidate(s) from a previous run")
++    except Exception as e:
++        logger.error(f"Stale backup cleanup failed at startup: {e}")
+diff --git a/changedetectionio/tests/test_backup.py b/changedetectionio/tests/test_backup.py
+index b528c187..daf43c1d 100644
+--- a/changedetectionio/tests/test_backup.py
++++ b/changedetectionio/tests/test_backup.py
+@@ -1,12 +1,17 @@
+ #!/usr/bin/env python3
+ 
+-from .util import set_original_response, live_server_setup, wait_for_all_checks
+-from flask import url_for
+ import io
+-from zipfile import ZipFile, ZIP_DEFLATED
++import json
++import os
+ import re
+ import time
+-from changedetectionio.model import Watch, Tag
++from zipfile import ZipFile, ZIP_DEFLATED
++
++from flask import url_for
++
++from changedetectionio.model import Tag, Watch
++
++from .util import live_server_setup, set_original_response, wait_for_all_checks
+ 
+ 
+ def test_backup(client, live_server, measure_memory_usage, datastore_path):
+@@ -261,6 +266,182 @@ def test_backup_restore_zip_bomb_rejected(client, live_server, measure_memory_us
+         restore_mod._MAX_DECOMPRESSED_BYTES = original_limit
+ 
+ 
++class _FakeWatch(dict):
++    """Minimal stand-in for a Watch.model object: data_dir + dict access."""
++    def __init__(self, data_dir, **kw):
++        super().__init__(**kw)
++        self.data_dir = data_dir
++
++
++def _write_json(path, data):
++    with open(path, 'w', encoding='utf-8') as f:
++        json.dump(data, f)
++
++
++def test_backup_rejects_torn_history_and_retries(tmp_path):
++    """An index referencing a snapshot that vanished (trim/half commit) must not
++    be published; the candidate is removed and the next request succeeds."""
++    import pytest
++
++    from changedetectionio.blueprint.backups import BackupBuildError, create_backup
++
++    datastore_dir = str(tmp_path)
++    uuid = "11111111-1111-4111-8111-111111111111"
++    watch_dir = os.path.join(datastore_dir, uuid)
++    os.makedirs(watch_dir)
++    snapshot_name = "abcdef.txt"
++
++    _write_json(os.path.join(watch_dir, "watch.json"), {
++        "uuid": uuid,
++        "url": "https://example.com/",
++        "processor": "text_json_diff",
++        "last_checked": 1700000000,
++        "tags": [],
++    })
++    # Index points at a snapshot that is not on disk (trimmed mid-backup/raced)
++    with open(os.path.join(watch_dir, "history.txt"), "w", encoding="utf-8") as f:
++        f.write(f"1700000000,{snapshot_name}\n")
++
++    watches = {uuid: _FakeWatch(watch_dir, url="https://example.com/", tags=[])}
++
++    with pytest.raises(BackupBuildError):
++        create_backup(datastore_path=datastore_dir, watches=watches, tags={})
++
++    # No published archive, no candidate leftovers
++    assert not [n for n in os.listdir(datastore_dir) if n.endswith(".zip")]
++    assert not [n for n in os.listdir(datastore_dir) if n.startswith(".backup-candidate-")]
++
++    # The check boundary becomes complete (snapshot appears): retry succeeds
++    with open(os.path.join(watch_dir, snapshot_name), "w", encoding="utf-8") as f:
++        f.write("snapshot body")
++    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags={})
++    assert os.path.isfile(backup_path)
++
++    with ZipFile(backup_path) as zf:
++        names = set(zf.namelist())
++        assert f"{uuid}/watch.json" in names
++        assert f"{uuid}/history.txt" in names
++        assert f"{uuid}/{snapshot_name}" in names
++
++
++def test_backup_cleans_stale_candidates_but_keeps_completed_backups(tmp_path):
++    """Interrupted candidates are removed; already published *.zip backups survive."""
++    from changedetectionio.blueprint.backups import CANDIDATE_DIR_PREFIX, create_backup
++
++    datastore_dir = str(tmp_path)
++
++    old_backup = os.path.join(datastore_dir, "changedetection-backup-20000101000000.zip")
++    with ZipFile(old_backup, "w") as zf:
++        zf.writestr("changedetection.json", "{}")
++
++    # New-scheme candidate directory (process died while building)
++    dead_dir = os.path.join(datastore_dir, CANDIDATE_DIR_PREFIX + "1234-deadbeef")
++    os.makedirs(dead_dir)
++    with open(os.path.join(dead_dir, "half.zip"), "w") as f:
++        f.write("partial")
++    # Old-scheme leftover
++    with open(os.path.join(datastore_dir, "changedetection-backup-20000101010101.tmp"), "w") as f:
++        f.write("legacy partial")
++
++    # Empty instance (no watch dirs) - background creation must still work
++    create_backup(datastore_path=datastore_dir, watches={}, tags={})
++
++    assert os.path.isfile(old_backup), "a completed old backup must remain downloadable"
++    leftovers = [n for n in os.listdir(datastore_dir)
++                 if n.startswith(CANDIDATE_DIR_PREFIX) or n.endswith(".tmp")]
++    assert leftovers == [], f"unfinished candidates must be cleaned: {leftovers}"
++    published = [n for n in os.listdir(datastore_dir)
++                 if n.startswith("changedetection-backup-") and n.endswith(".zip")]
++    assert len(published) == 2
++
++
++def test_backup_is_a_consistent_watch_boundary(tmp_path):
++    """All files of one watch land in the archive; scratch files never do; the
++    URL list only references the archived watch."""
++    from changedetectionio.blueprint.backups import create_backup
++
++    datastore_dir = str(tmp_path)
++    uuid = "22222222-2222-4222-a222-222222222222"
++    tag_uuid = "33333333-3333-4333-b333-333333333333"
++    watch_dir = os.path.join(datastore_dir, uuid)
++    tag_dir = os.path.join(datastore_dir, tag_uuid)
++    os.makedirs(watch_dir)
++    os.makedirs(tag_dir)
++
++    _write_json(os.path.join(datastore_dir, "changedetection.json"), {
++        "settings": {"application": {"tags": {}}}
++    })
++    _write_json(os.path.join(watch_dir, "watch.json"), {
++        "uuid": uuid,
++        "url": "https://example.com/űrlap?x=ő",
++        "processor": "restock_diff",
++        "last_checked": 1700000005,
++        "tags": [tag_uuid],
++    })
++    _write_json(os.path.join(watch_dir, "restock_diff.json"), {"in_stock_only": True})
++    with open(os.path.join(watch_dir, "history-restock_diff.txt"), "w", encoding="utf-8") as f:
++        f.write("1700000005,snap-5.txt.br\n")
++    with open(os.path.join(watch_dir, "snap-5.txt.br"), "wb") as f:
++        f.write(b"compressed-snapshot")
++    # Writer scratch files must never enter the archive
++    with open(os.path.join(watch_dir, "tmpXYZ"), "w") as f:
++        f.write("scratch")
++    with open(os.path.join(watch_dir, "json-xyz.tmp"), "w") as f:
++        f.write("scratch")
++    _write_json(os.path.join(tag_dir, "tag.json"), {"uuid": tag_uuid, "title": "Gruppe 🏷️"})
++
++    watches = {uuid: _FakeWatch(watch_dir,
++                                url="https://example.com/űrlap?x=ő",
++                                tags=[tag_uuid])}
++    tags = {tag_uuid: _FakeWatch(tag_dir, title="Gruppe 🏷️")}
++
++    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags=tags)
++    with ZipFile(backup_path) as zf:
++        names = set(zf.namelist())
++
++    assert f"{uuid}/watch.json" in names
++    assert f"{uuid}/restock_diff.json" in names
++    assert f"{uuid}/history-restock_diff.txt" in names
++    assert f"{uuid}/snap-5.txt.br" in names
++    assert f"{tag_uuid}/tag.json" in names
++    assert "changedetection.json" in names
++    assert f"{uuid}/tmpXYZ" not in names
++    assert f"{uuid}/json-xyz.tmp" not in names
++    assert "secret.txt" not in names
++
++    with ZipFile(backup_path) as zf:
++        assert "example.com/űrlap" in zf.read("url-list.txt").decode("utf-8")
++        assert tag_uuid in zf.read("url-list-with-tags.txt").decode("utf-8")
++
++
++def test_backup_watch_without_committed_watch_json_deferred(tmp_path):
++    """A half-created watch directory (no watch.json yet) waits for the next
++    archive instead of being published as a partial entry."""
++    from changedetectionio.blueprint.backups import create_backup
++
++    datastore_dir = str(tmp_path)
++    uuid = "44444444-4444-4444-8444-444444444444"
++    watch_dir = os.path.join(datastore_dir, uuid)
++    os.makedirs(watch_dir)
++    with open(os.path.join(watch_dir, "last-screenshot.png"), "wb") as f:
++        f.write(b"\x89PNG-fake")
++
++    watches = {uuid: _FakeWatch(watch_dir, url="https://example.com/new", tags=[])}
++    backup_path = create_backup(datastore_path=datastore_dir, watches=watches, tags={})
++
++    with ZipFile(backup_path) as zf:
++        names = set(zf.namelist())
++    assert f"{uuid}/last-screenshot.png" not in names
++    assert f"{uuid}/watch.json" not in names
++    # The URL list must not reference a watch missing from the archive
++    assert "https://example.com/new" not in zf_read(backup_path, "url-list.txt")
++
++
++def zf_read(zip_path, member):
++    with ZipFile(zip_path) as zf:
++        return zf.read(member).decode("utf-8")
++
++
+ def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
+     """Test create_backup handles extended UTF-8 characters in URLs and tags without encoding errors (issue #1805)."""
+     import os
+@@ -269,21 +450,42 @@ def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
+ 
+     from changedetectionio.blueprint.backups import create_backup
+ 
++    utf8_url = "https://example.com/products/café-öl-日本語-🎉?query=test#section"
++    utf8_tag_titles = ["Größe", "日本語タグ", "🏷️special"]
++    tag_uuids = [
++        "aaaaaaaa-0000-4000-8000-000000000001",
++        "aaaaaaaa-0000-4000-8000-000000000002",
++        "aaaaaaaa-0000-4000-8000-000000000003",
++    ]
++
+     with tempfile.TemporaryDirectory() as tmp_dir:
++        # A committed watch boundary: its own data directory with watch.json
++        watch_data_dir = os.path.join(tmp_dir, "test-uuid-1")
++        os.makedirs(watch_data_dir)
++        with open(os.path.join(watch_data_dir, "watch.json"), "w", encoding="utf-8") as f:
++            json.dump({"uuid": "test-uuid-1", "url": utf8_url, "tags": tag_uuids}, f)
++
+         watch_mock = MagicMock()
+-        watch_mock.data_dir = tmp_dir
+-        watch_mock.__getitem__.side_effect = lambda key: (
+-            "https://example.com/products/café-öl-日本語-🎉?query=test#section" if key == "url" else None
+-        )
++        watch_mock.data_dir = watch_data_dir
++        watch_mock.__getitem__.side_effect = lambda key: utf8_url if key == "url" else None
+         watch_mock.get.side_effect = lambda key, default=None: (
+-            "https://example.com/products/café-öl-日本語-🎉?query=test#section"
+-            if key == "url"
+-            else (["Größe", "日本語タグ", "🏷️special"] if key == "tags" else default)
++            utf8_url if key == "url" else (tag_uuids if key == "tags" else default)
+         )
+ 
++        tag_mocks = {}
++        for tag_uuid, title in zip(tag_uuids, utf8_tag_titles, strict=True):
++            tag_dir = os.path.join(tmp_dir, tag_uuid)
++            os.makedirs(tag_dir)
++            with open(os.path.join(tag_dir, "tag.json"), "w", encoding="utf-8") as f:
++                json.dump({"uuid": tag_uuid, "title": title}, f, ensure_ascii=False)
++            tag_mock = MagicMock()
++            tag_mock.data_dir = tag_dir
++            tag_mock.get.side_effect = lambda key, default=None, t=title: t if key == "title" else default
++            tag_mocks[tag_uuid] = tag_mock
++
+         watches = {"test-uuid-1": watch_mock}
+         # Should create backup without UnicodeEncodeError
+-        create_backup(datastore_path=tmp_dir, watches=watches, tags={})
++        backup_path = create_backup(datastore_path=tmp_dir, watches=watches, tags=tag_mocks)
+ 
+         url_list_path = os.path.join(tmp_dir, "url-list.txt")
+         url_list_tags_path = os.path.join(tmp_dir, "url-list-with-tags.txt")
+@@ -298,6 +500,10 @@ def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
+         with open(url_list_tags_path, encoding="utf-8") as f:
+             content = f.read()
+             assert "café-öl-日本語-🎉" in content
+-            assert "Größe" in content
+-            assert "日本語タグ" in content
+-            assert "🏷️special" in content
++            for tag_uuid in tag_uuids:
++                assert tag_uuid in content
++
++        # Group titles (UTF-8) survive into the archive as well
++        with ZipFile(backup_path) as zf:
++            for tag_uuid, title in zip(tag_uuids, utf8_tag_titles, strict=True):
++                assert title in zf.read(f"{tag_uuid}/tag.json").decode("utf-8")
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 00000000..5c51faa5
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,8 @@
++dgtlmoon-changedetection.io-771cca64-2e9d-4295-a5bc-053d969bf639
++Rubric ID：1｜状态：通过｜期望行为：空闲创建、latest、数量限制、UTF-8、恢复合法归档不回归。｜实际观察：UTF-8/候选清理/完整边界等聚焦用例通过；完整套件另有 7 项通过，3 项受 Windows live-server fixture 无法 pickle 影响。｜直接证据：pytest 聚焦用例通过；test_backup.py:327-507；find_backups 与 download 路径保留。
++Rubric ID：2｜状态：未通过｜期望行为：每个 watch 只包含一个完整已提交检查边界。｜实际观察：将 restock_diff.json 更新为 new、保持 watch.json 为 old 且目录稳定，create_backup 成功发布 ZIP，归档输出为 https://old 与 threshold new。｜直接证据：对抗输出 P2_MIXED_ARCHIVE_PUBLISHED ... https://old new。｜原因：备份只验证单目录复制期间文件不变，稳定的旧 watch.json 与新处理器配置会被发布为同一 ZIP｜影响：当前归档能够混入不同时间完成的配置部分。｜证据位置：changedetectionio/blueprint/backups/__init__.py:93-127、357-416。
++Rubric ID：3｜状态：未通过｜期望行为：主配置、处理器配置、history 与附属结果来自同一边界。｜实际观察：归档包含旧 watch.json 和新 restock_diff.json，二者在复制前已经稳定，现有校验接受并发布。｜直接证据：P2_MIXED_ARCHIVE_PUBLISHED changedetection-backup-...zip https://old new。｜原因：watch.json 与处理器 JSON 没有共同提交代际，归档可包含旧主配置和新处理器设置｜影响：恢复后 worker 与 UI 可读取新处理器设置配旧主配置。｜证据位置：backups/__init__.py:365-416。
++Rubric ID：4｜状态：通过｜期望行为：被选文件消失时废弃候选且旧备份可用、后续可重试。｜实际观察：缺失 snapshot 的 history 使 create_backup 抛出 BackupBuildError，不发布 ZIP且清理候选；补齐文件后重试成功。｜直接证据：test_backup.py:281-324；聚焦 pytest 通过。
++Rubric ID：5｜状态：未通过｜期望行为：读取、关闭或 rename 失败不发布并向创建页面留下可诊断结果。｜实际观察：强制最终 rename 失败后没有新 ZIP且候选为空，但 run_backup_in_background 只记录 logger.error，页面状态仅依据线程 alive，结束后不显示失败原因。｜直接证据：P2_RENAME_ERROR OSError forced final rename failure；P2_RENAME_NO_NEW_ZIP True CANDIDATES []；backups/__init__.py:555-566、654-660。｜原因：后台线程仅把创建失败写入日志，创建页面没有持久化或可读取的失败结果｜影响：管理员看到备份停止运行但无法从创建页面获知失败原因。｜证据位置：changedetectionio/blueprint/backups/__init__.py:555-566、651-660。
++Rubric ID：6｜状态：通过｜期望行为：发布前中断后清理候选且不覆盖旧归档、不永久运行。｜实际观察：启动和每次创建前清理候选目录及旧 tmp，已发布 zip 不处理；线程列表在请求和页面读取时剔除已结束线程。｜直接证据：backups/__init__.py:221-270、510-530、615-624、654-660；候选清理测试通过。
++Rubric ID：7｜状态：通过｜期望行为：不使用覆盖检查时长的全局停机锁。｜实际观察：备份按目录双扫描并在不稳定时重试，没有获取 worker 全局锁或暂停调度。｜直接证据：backups/__init__.py:56-127、501-552；代码搜索未发现 worker 停机或全局锁调用。
+diff --git a/evidence/screenshots/01-rubric-comparison.png b/evidence/screenshots/01-rubric-comparison.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5aa25e51042650985db09d38a24ce751ebbbf159
+GIT binary patch
+literal 46081
+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
+L2b(@V^~L`MwifPD
+
+literal 0
+HcmV?d00001
+
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 00000000..f9ac949e
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,23 @@
++rubrics:
++- id: 1
++  type: p2p
++  text: 没有并发写入时，后台创建、latest 下载、备份数量限制、UTF-8 URL/tag 和现有合法归档的恢复行为不回归。
++- id: 2
++  type: f2p
++  text: 检查在归档期间完成时，当前 ZIP 对每个 watch 只包含一个完整已提交边界；history.txt 中每个条目都有对应可读取快照，下一次备份可包含更新代际。
++- id: 3
++  type: f2p
++  text: watch.json、当前处理器 JSON、history 索引、截图/HTML等被纳入的附属结果来自同一选择边界，恢复后 worker 和 UI
++    不会观察混合配置或缺失资源。
++- id: 4
++  type: f2p
++  text: 历史裁剪或并发删除使已选择文件消失时，整份候选备份失败而不是跳过文件发布；旧备份保持可用，后续重试能够创建完整新备份。
++- id: 5
++  type: f2p
++  text: 读取、压缩、关闭或最终 rename 失败时不会出现可下载的新 .zip，临时文件和运行标记得到清理，并向创建页面留下可诊断结果。
++- id: 6
++  type: f2p
++  text: 进程或线程在候选写完但发布前中断后，启动或下一次请求能确定清理未完成候选，不覆盖同名已完成归档，也不会永久认为备份仍在运行。
++- id: 7
++  type: f2p
++  text: 备份一致性机制不会用一个覆盖全部检查时长的全局停机锁阻塞正常 worker；并发检查可继续完成，而归档通过明确的提交边界保持可恢复。
