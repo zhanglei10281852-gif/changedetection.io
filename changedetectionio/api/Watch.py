@@ -144,15 +144,8 @@ class Watch(Resource):
         watch['open_link'] = watch_obj.open_link
 
         # Resolved processor config: tag override wins over watch-level config (mirrors restock processor logic)
-        import json
-        _restock_path = os.path.join(watch_obj.data_dir, 'restock_diff.json') if watch_obj.data_dir else None
-        restock_config = {}
-        if _restock_path and os.path.isfile(_restock_path):
-            try:
-                with open(_restock_path, 'r', encoding='utf-8') as _f:
-                    restock_config = json.load(_f).get('restock_diff') or {}
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Failed to read restock_diff.json for watch {uuid}: {e}")
+        # Read through the joint-publication layer so this converges with UI/worker/restart reads
+        restock_config = (self.datastore.read_watch_processor_config(uuid, 'restock_diff.json') or {}).get('restock_diff') or {}
         restock_source = 'watch'
         tags = self.datastore.data['settings']['application'].get('tags', {})
         for tag_uuid in (watch_obj.get('tags') or []):
@@ -268,12 +261,36 @@ class Watch(Resource):
         if unknown_fields:
             return f"Unknown field(s): {', '.join(sorted(unknown_fields))}", 400
 
-        # Update watch with regular (non-processor-config) fields
-        watch.update(json_data)
-        watch.commit()
+        # Optimistic-concurrency token (optional): GET returns config_version,
+        # clients send it back in If-Match. A concurrent newer save makes this PUT
+        # fail with 409 instead of clobbering the newer generation.
+        expected_version = None
+        if_match = (request.headers.get('If-Match') or '').strip()
+        if if_match and if_match != '*':
+            expected_version = if_match.strip('"').removeprefix('W/').strip().strip('"')
+            try:
+                expected_version = int(expected_version)
+            except ValueError:
+                return "If-Match must be the numeric config_version of the watch (or '*')", 400
 
-        # Save processor config to JSON file
-        processors.save_processor_config(self.datastore, uuid, processor_config_data)
+        # Joint publication: regular fields (watch.json) and processor config
+        # ({processor}.json) are staged and committed as one generation. Failure
+        # returns an explicit error, the previous complete configuration stays
+        # active (disk and memory), and no immediate recheck is queued.
+        from changedetectionio.store import StaleConfigVersionError, ConfigPublishError
+        try:
+            self.datastore.publish_watch_update(
+                uuid,
+                watch_updates=json_data,
+                processor_config=processor_config_data or None,
+                expected_version=expected_version,
+            )
+        except StaleConfigVersionError as e:
+            return (f"Watch configuration is newer than the version this request was based on "
+                    f"(current generation: {e.current_version}). Reload and retry."), 409
+        except (ConfigPublishError, OSError, ValueError) as e:
+            logger.error(f"Failed to jointly publish watch {uuid} configuration: {e}")
+            return f"Failed to save watch configuration: {e}", 500
 
         return "OK", 200
 
@@ -583,9 +600,18 @@ class CreateWatch(Resource):
 
         new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
 
-        # Save processor config to separate JSON file
+        # First-time creation is a joint publication too: watch.json and the
+        # processor config appear together as one generation. If the processor
+        # settings cannot be persisted, remove the half-created watch and report
+        # an explicit error instead of returning success with missing settings.
         if new_uuid and processor_config_data:
-            processors.save_processor_config(self.datastore, new_uuid, processor_config_data)
+            from changedetectionio.store import ConfigPublishError
+            try:
+                self.datastore.publish_watch_update(new_uuid, processor_config=processor_config_data)
+            except (ConfigPublishError, OSError, ValueError) as e:
+                logger.error(f"Failed to publish processor config for new watch {new_uuid}: {e}")
+                self.datastore.delete(new_uuid)
+                return f"Failed to save watch configuration: {e}", 500
         if new_uuid:
 # Dont queue because the scheduler will check that it hasnt been checked before anyway
 #            worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': new_uuid}))

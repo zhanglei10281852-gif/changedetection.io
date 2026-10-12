@@ -284,6 +284,16 @@ components:
           format: uuid
           description: Unique identifier
           readOnly: true
+        config_version:
+          type: integer
+          minimum: 0
+          description: |
+            Monotonic generation of the watch's jointly-published configuration
+            (`watch.json` plus the current processor's settings). Returned on GET.
+            Send the value read from GET back in the `If-Match` header on PUT to
+            make sure a concurrent newer save cannot be overwritten; a stale
+            value yields HTTP 409.
+          readOnly: true
         date_created:
           type: [integer, 'null']
           description: Unix timestamp of creation
@@ -1190,6 +1200,17 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: If-Match
+          in: header
+          required: false
+          description: |
+            Optimistic-concurrency token: the `config_version` returned by GET.
+            When it no longer matches the watch's current generation because a
+            concurrent save won, the PUT fails with `409` instead of overwriting
+            the newer configuration. `*` (or omitted) skips the check.
+          schema:
+            type: string
+          example: '"3"'
       requestBody:
         required: true
         content:
@@ -1204,8 +1225,14 @@ paths:
               schema:
                 type: string
                 example: "OK"
+        '409':
+          description: The watch configuration changed since the request was based on it (stale `If-Match`/`config_version`); reload and retry
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          description: Server error
+          description: Server error (joint configuration publication failed; the previous configuration remains active)
 
     delete:
       operationId: deleteWatch

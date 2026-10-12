@@ -330,45 +330,54 @@ class difference_detection_processor():
         """
         Read processor-specific JSON config file from watch data directory.
 
+        Goes through the joint-publication layer: while a save is mid-flight
+        this returns the previous COMPLETE generation (from the transaction
+        backup) rather than a possibly half-published file.
+
         Args:
-            filename: Name of JSON file (e.g., "visual_ssim_score.json")
+            filename: Name of JSON file (e.g., "restock_diff.json")
 
         Returns:
             dict: Parsed JSON data, or empty dict if file doesn't exist
         """
-        import json
         import os
 
         watch = self.datastore.data['watching'].get(self.watch_uuid)
-        data_dir = watch.data_dir
-
-        if not data_dir:
+        if not watch or not watch.data_dir:
             return {}
 
-        filepath = self._resolve_watch_config_path(data_dir, filename)
+        filepath = self._resolve_watch_config_path(watch.data_dir, filename)
         if not filepath:
             return {}
 
         if not os.path.isfile(filepath):
             return {}
 
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.warning(f"Failed to read extra watch config {filename}: {e}")
-            return {}
+        # Transaction-aware: hides prepared (not yet committed) generations.
+        datastore = getattr(self.datastore, 'read_watch_processor_config', None)
+        if callable(datastore):
+            return datastore(self.watch_uuid, filename)
+
+        # Fallback for datastores that do not provide the joint-publish layer
+        from changedetectionio.store.config_transaction import load_committed_json, strip_transaction_keys
+        return strip_transaction_keys(load_committed_json(watch.data_dir, filename))
 
     def update_extra_watch_config(self, filename, data, merge=True):
         """
         Write processor-specific JSON config file to watch data directory.
+
+        Atomic (temp file + os.replace): a crash can never leave a truncated
+        JSON here that readers would silently fall back to defaults on.
+
+        NOTE: Watch save entry points (edit page, REST API) must persist this
+        TOGETHER with watch.json via datastore.publish_watch_update(); this
+        standalone writer remains for processor-internal use.
 
         Args:
             filename: Name of JSON file (e.g., "visual_ssim_score.json")
             data: Dictionary to serialize as JSON
             merge: If True, merge with existing data; if False, overwrite completely
         """
-        import json
         import os
 
         watch = self.datastore.data['watching'].get(self.watch_uuid)
@@ -385,28 +394,21 @@ class difference_detection_processor():
         if not filepath:
             return
 
-        try:
-            # If merge is enabled, read existing data first
-            existing_data = {}
-            if merge and os.path.isfile(filepath):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.warning(f"Failed to read existing config for merge: {e}")
+        # Read the last committed version through the transaction-aware reader,
+        # so an in-flight joint publication cannot be merged into/overwritten.
+        existing_data = {}
+        if merge and os.path.isfile(filepath):
+            existing_data = self.get_extra_watch_config(filename)
 
-            # Merge new data with existing
-            if merge:
-                existing_data.update(data)
-                data_to_save = existing_data
-            else:
-                data_to_save = data
+        if merge:
+            existing_data.update(data)
+            data_to_save = existing_data
+        else:
+            data_to_save = data
 
-            # Write the data
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data_to_save, f, indent=2)
-        except IOError as e:
-            logger.error(f"Failed to write extra watch config {filename}: {e}")
+        # Atomic single-file publication
+        from changedetectionio.store.file_saving_datastore import save_json_atomic
+        save_json_atomic(filepath, data_to_save, label=f"processor config {filename}", max_size_mb=1)
 
     def get_raw_document_checksum(self):
         checksum = None

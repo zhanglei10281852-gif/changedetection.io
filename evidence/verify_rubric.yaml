@@ -1,0 +1,22 @@
+rubrics:
+- id: 1
+  type: p2p
+  text: 普通 text processor、没有专用配置、首次创建、tag override 以及切换处理器再切回时保存各自设置的现有语义不回归。
+- id: 2
+  type: f2p
+  text: UI 保存中 processor JSON 或 Watch 持久化任一步失败时不显示成功、不排立即检查，旧主配置和旧处理器配置继续共同生效。
+- id: 3
+  type: f2p
+  text: API PUT 任一部分失败返回非成功响应，GET API 仍展示旧完整配置，服务重启也加载旧成功代际。
+- id: 4
+  type: f2p
+  text: 进程在两个文件写入或共同发布之间中断时，worker 与 edit/GET 不读取混合代际，启动能够确定回滚或完成且最终清理候选资源。
+- id: 5
+  type: f2p
+  text: 成功保存后 watch.json、当前 processor JSON、UI 回显、GET API、worker 检查和重启加载观察同一已提交配置代际。
+- id: 6
+  type: f2p
+  text: processor JSON 写入被中断不会截断当前有效配置或触发静默默认值；临时文件的失败清理不会删除已提交设置。
+- id: 7
+  type: f2p
+  text: 并发 UI/API 更新按确定顺序发布，迟到成功或失败不能覆盖较新代际、排错配置的检查或留下永久半提交。

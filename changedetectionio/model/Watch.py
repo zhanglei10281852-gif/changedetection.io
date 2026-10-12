@@ -267,6 +267,12 @@ class model(EntityPersistenceMixin, watch_base):
             if not isinstance(self['restock'], Restock):
                 self['restock'] = Restock(self['restock'])
 
+        # Monotonic generation of the jointly-published (watch.json + processor
+        # config) configuration. 0 for watches saved before this existed; every
+        # successful joint save bumps it by one. Used for optimistic concurrency
+        # (edit form hidden field / API If-Match) and crash recovery.
+        self.setdefault('config_version', 0)
+
         # Be sure the cached timestamp is ready
         bump = self.history
 
@@ -369,15 +375,17 @@ class model(EntityPersistenceMixin, watch_base):
 
         # Get list of processor config files to preserve
         from changedetectionio.processors import find_processors
+        from changedetectionio.store.config_transaction import _TX_PREFIX
         processor_names = [name for cls, name in find_processors()]
         processor_config_files = {f"{name}.json" for name in processor_names}
 
         # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
         # But preserve processor config files (they're configuration, not history data)
+        # and in-flight joint-publication debris (candidates/backups/markers).
         # Use glob not rglob here for safety.
         for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
             # Skip processor config files
-            if item.name in processor_config_files:
+            if item.name in processor_config_files or item.name.startswith(_TX_PREFIX):
                 continue
             os.unlink(item)
 

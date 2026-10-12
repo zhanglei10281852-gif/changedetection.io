@@ -206,6 +206,14 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
         if request.method == 'POST' and form.validate():
 
+            # Optimistic-concurrency token: the config_version the rendered form
+            # was based on. A concurrent newer successful save makes this fail
+            # explicitly instead of silently overwriting the newer version.
+            try:
+                expected_config_version = int((request.form.get('config_version') or '').strip() or 0)
+            except ValueError:
+                expected_config_version = None
+
             extra_update_obj = {
                 'consecutive_filter_failures': 0,
                 'last_error' : False
@@ -216,10 +224,9 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
             extra_update_obj['time_between_check'] = form.time_between_check.data
 
-            # Handle processor-config-* fields separately (save to JSON, not datastore)
-            # IMPORTANT: These must NOT be saved to url-watches.json, only to the processor-specific JSON file
+            # Handle processor-config-* fields separately (saved jointly with watch.json)
+            # IMPORTANT: These must NOT be saved to watch.json, only to the processor-specific JSON file
             processor_config_data = processors.extract_processor_config_from_form_data(form.data)
-            processors.save_processor_config(datastore, uuid, processor_config_data)
 
             # Ignore text
             form_ignore_text = form.ignore_text.data
@@ -271,8 +278,27 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             watch_class = processors.get_custom_watch_obj_for_processor(form.data.get('processor'))
             datastore.data['watching'][uuid] = watch_class(datastore_path=datastore.datastore_path, __datastore=datastore.data, default=datastore.data['watching'][uuid])
 
-            # Save the watch immediately
-            datastore.data['watching'][uuid].commit()
+            # Joint publication: watch.json AND the current processor's settings are
+            # staged and committed as one generation. Any failure leaves the old
+            # complete configuration in effect (on disk and in memory), surfaces a
+            # clear error here, and - crucially - does not queue an immediate check.
+            try:
+                datastore.publish_watch_update(
+                    uuid,
+                    processor_config=processor_config_data or None,
+                    expected_version=expected_config_version,
+                )
+            except Exception as e:
+                from changedetectionio.store import StaleConfigVersionError
+                if isinstance(e, StaleConfigVersionError):
+                    flash(gettext("This watch was saved in another tab or request since this page loaded. "
+                                 "Reload the page to see the newest configuration and apply your changes again."),
+                          'error')
+                else:
+                    logger.error(f"Failed to save watch {uuid} configuration: {e}")
+                    flash(gettext("Could not save the watch configuration: %(error)s. The previous settings remain active.",
+                                 error=str(e)), 'error')
+                return redirect(url_for('ui.ui_edit.edit_page', uuid=uuid))
 
             flash(gettext("Updated watch - unpaused!") if request.args.get('unpause_on_save') else gettext("Updated watch."))
 
@@ -469,8 +495,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
             # Add all files in the watch data directory
             if os.path.isdir(watch.data_dir):
+                from changedetectionio.store.config_transaction import _TX_PREFIX
                 for f in Path(watch.data_dir).glob('*'):
-                    if f.is_file() and f.name != 'watch.json':  # Skip watch.json since we already added it
+                    # Skip joint-publication debris (candidates/backups/markers)
+                    if f.is_file() and f.name != 'watch.json' and not f.name.startswith(_TX_PREFIX):
                         zipObj.write(f,
                                    arcname=os.path.join(uuid, f.name),
                                    compress_type=zipfile.ZIP_DEFLATED,

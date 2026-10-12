@@ -39,6 +39,18 @@ from ..processors import get_custom_watch_obj_for_processor, find_processors
 from .file_saving_datastore import (FileSavingDataStore, load_all_watches, load_all_tags, load_watch_from_file,
                                     save_json_atomic)
 from .updates import DatastoreUpdatesMixin
+from .config_transaction import (
+    WATCH_CONFIG_VERSION_KEY,
+    PROCESSOR_CONFIG_VERSION_KEY,
+    StaleConfigVersionError,
+    ConfigPublishError,
+    ConfigTransactionError,
+    joint_publish,
+    load_committed_json,
+    recover_all_config_transactions,
+    strip_transaction_keys,
+    watch_config_lock,
+)
 
 # Because the server will run as a daemon and wont know the URL for notification links when firing off a notification
 BASE_URL_NOT_SET_TEXT = '("Base URL" not set - see settings - notifications)'
@@ -206,6 +218,11 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
 
         # CRITICAL: Update datastore_path (was using old path from __init__)
         self.datastore_path = datastore_path
+
+        # Resolve any interrupted joint watch.json + processor-config publications
+        # BEFORE any watch is loaded - a crash between the two writes must end in a
+        # deterministic rollback or completed commit, never a mixed generation.
+        recover_all_config_transactions(datastore_path)
 
         # Initialize data structure
         self.__data = App.model(datastore_path=datastore_path)
@@ -571,6 +588,138 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
 
         # Immediate save
         self.__data['watching'][uuid].commit()
+
+    # ------------------------------------------------------------------
+    # Joint publication of watch.json + the current processor's own config
+    # ------------------------------------------------------------------
+
+    # Filenames accepted for a processor config (same rule as save_processor_config)
+    _SAFE_PROCESSOR_NAME_RE = re.compile(r'[A-Za-z0-9_-]+')
+
+    def read_watch_processor_config(self, uuid, filename):
+        """Transaction-aware read of a watch's {processor}.json ({} if absent).
+
+        Serves the last COMPLETE generation while a publication is in flight.
+        Reserved transaction keys are stripped from the result.
+        """
+        watch = self.__data['watching'].get(uuid)
+        if not watch or not watch.data_dir:
+            return {}
+        return strip_transaction_keys(load_committed_json(watch.data_dir, filename))
+
+    def publish_watch_update(self, uuid, watch_updates=None, processor_config=None,
+                            expected_version=None):
+        """Jointly publish the main watch config and the processor's settings.
+
+        Both files are staged first and only published as one generation, so
+        the UI, GET API, check worker and a restarted process can never observe a
+        half-saved mix. On ANY failure the previous complete configuration keeps
+        working (disk is rolled back, the in-memory watch is restored) and the
+        exception propagates to the entry point - nothing queues an immediate
+        check after a failed save.
+
+        Args:
+            uuid: watch UUID
+            watch_updates: optional dict of main-config fields to apply to the
+                           live watch before publishing
+            processor_config: optional extracted processor_config_* payload
+                           (prefix removed). When falsy/None, only watch.json is
+                           published - the existing processor file stays valid.
+                           When provided, it is merged into the current
+                           processor's file (same merge semantics as before).
+            expected_version: config_version the edit/API request was based on;
+                           a concurrent newer successful save raises
+                           StaleConfigVersionError (HTTP 409 at the entry point).
+
+        Returns:
+            int: the new config_version
+
+        Raises:
+            StaleConfigVersionError, ConfigPublishError (or the underlying
+            OSError) on failure.
+        """
+        from copy import deepcopy
+
+        lock = watch_config_lock(self.datastore_path, uuid)
+        with lock:
+            watch = self.__data['watching'].get(uuid)
+            if not watch:
+                raise ConfigPublishError(f"Cannot publish watch {uuid}: watch not found")
+
+            # Park the full live object so any failure restores in-memory state to
+            # the old complete configuration too (worker keeps running old config).
+            snapshot = deepcopy(watch)
+            snapshot_class = watch.__class__
+
+            try:
+                current_version = int(watch.get(WATCH_CONFIG_VERSION_KEY) or 0)
+
+                if expected_version is not None:
+                    try:
+                        expected_version = int(expected_version)
+                    except (TypeError, ValueError):
+                        raise StaleConfigVersionError(current_version, expected_version)
+                    if expected_version != current_version:
+                        raise StaleConfigVersionError(current_version, expected_version)
+
+                if watch_updates:
+                    watch.update(watch_updates)
+
+                new_version = current_version + 1
+
+                # Main watch config (processor_config_* keys are excluded there)
+                watch_payload = watch._get_commit_data()
+                watch_payload[WATCH_CONFIG_VERSION_KEY] = new_version
+
+                parts = [{
+                    'final': 'watch.json',
+                    'payload': watch_payload,
+                    'version_key': WATCH_CONFIG_VERSION_KEY,
+                    'max_size_mb': 10,
+                }]
+
+                # Current processor's dedicated settings file
+                if processor_config:
+                    processor_name = watch.get('processor') or 'text_json_diff'
+                    if not self._SAFE_PROCESSOR_NAME_RE.fullmatch(processor_name or ''):
+                        raise ConfigPublishError(
+                            f"Refusing to publish processor config: unsafe processor name "
+                            f"{processor_name!r} on watch {uuid}"
+                        )
+
+                    filename = f'{processor_name}.json'
+                    # Merge with the currently committed file - nested keys (e.g.
+                    # {'restock_diff': {...}}) replace wholesale, flat keys merge,
+                    # exactly like the previous update_extra_watch_config(merge=True).
+                    existing = load_committed_json(watch.data_dir, filename)
+                    merged = strip_transaction_keys(existing)
+                    merged.update(processor_config)
+                    merged[PROCESSOR_CONFIG_VERSION_KEY] = new_version
+
+                    parts.append({
+                        'final': filename,
+                        'payload': merged,
+                        'version_key': PROCESSOR_CONFIG_VERSION_KEY,
+                        'max_size_mb': 1,
+                    })
+
+                joint_publish(watch.data_dir, parts, new_version)
+
+                # Bump in memory WITHOUT tripping was_edited: the configuration
+                # version is publication bookkeeping, not a user-edited field.
+                dict.__setitem__(watch, WATCH_CONFIG_VERSION_KEY, new_version)
+                logger.debug(f"Jointly published watch {uuid} configuration generation {new_version}")
+                return new_version
+
+            except BaseException:
+                # Restore the live object to the previous complete generation.
+                restored = snapshot_class(
+                    datastore_path=self.datastore_path,
+                    __datastore=self.__data,
+                    default=snapshot,
+                )
+                self.__data['watching'][uuid] = restored
+                raise
 
     @property
     def threshold_seconds(self):

@@ -1,0 +1,2606 @@
+diff --git a/changedetectionio/api/Watch.py b/changedetectionio/api/Watch.py
+index 66bcabdc..a95235ad 100644
+--- a/changedetectionio/api/Watch.py
++++ b/changedetectionio/api/Watch.py
+@@ -144,15 +144,8 @@ class Watch(Resource):
+         watch['open_link'] = watch_obj.open_link
+ 
+         # Resolved processor config: tag override wins over watch-level config (mirrors restock processor logic)
+-        import json
+-        _restock_path = os.path.join(watch_obj.data_dir, 'restock_diff.json') if watch_obj.data_dir else None
+-        restock_config = {}
+-        if _restock_path and os.path.isfile(_restock_path):
+-            try:
+-                with open(_restock_path, 'r', encoding='utf-8') as _f:
+-                    restock_config = json.load(_f).get('restock_diff') or {}
+-            except (json.JSONDecodeError, IOError) as e:
+-                logger.warning(f"Failed to read restock_diff.json for watch {uuid}: {e}")
++        # Read through the joint-publication layer so this converges with UI/worker/restart reads
++        restock_config = (self.datastore.read_watch_processor_config(uuid, 'restock_diff.json') or {}).get('restock_diff') or {}
+         restock_source = 'watch'
+         tags = self.datastore.data['settings']['application'].get('tags', {})
+         for tag_uuid in (watch_obj.get('tags') or []):
+@@ -268,12 +261,36 @@ class Watch(Resource):
+         if unknown_fields:
+             return f"Unknown field(s): {', '.join(sorted(unknown_fields))}", 400
+ 
+-        # Update watch with regular (non-processor-config) fields
+-        watch.update(json_data)
+-        watch.commit()
+-
+-        # Save processor config to JSON file
+-        processors.save_processor_config(self.datastore, uuid, processor_config_data)
++        # Optimistic-concurrency token (optional): GET returns config_version,
++        # clients send it back in If-Match. A concurrent newer save makes this PUT
++        # fail with 409 instead of clobbering the newer generation.
++        expected_version = None
++        if_match = (request.headers.get('If-Match') or '').strip()
++        if if_match and if_match != '*':
++            expected_version = if_match.strip('"').removeprefix('W/').strip().strip('"')
++            try:
++                expected_version = int(expected_version)
++            except ValueError:
++                return "If-Match must be the numeric config_version of the watch (or '*')", 400
++
++        # Joint publication: regular fields (watch.json) and processor config
++        # ({processor}.json) are staged and committed as one generation. Failure
++        # returns an explicit error, the previous complete configuration stays
++        # active (disk and memory), and no immediate recheck is queued.
++        from changedetectionio.store import StaleConfigVersionError, ConfigPublishError
++        try:
++            self.datastore.publish_watch_update(
++                uuid,
++                watch_updates=json_data,
++                processor_config=processor_config_data or None,
++                expected_version=expected_version,
++            )
++        except StaleConfigVersionError as e:
++            return (f"Watch configuration is newer than the version this request was based on "
++                    f"(current generation: {e.current_version}). Reload and retry."), 409
++        except (ConfigPublishError, OSError, ValueError) as e:
++            logger.error(f"Failed to jointly publish watch {uuid} configuration: {e}")
++            return f"Failed to save watch configuration: {e}", 500
+ 
+         return "OK", 200
+ 
+@@ -583,9 +600,18 @@ class CreateWatch(Resource):
+ 
+         new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
+ 
+-        # Save processor config to separate JSON file
++        # First-time creation is a joint publication too: watch.json and the
++        # processor config appear together as one generation. If the processor
++        # settings cannot be persisted, remove the half-created watch and report
++        # an explicit error instead of returning success with missing settings.
+         if new_uuid and processor_config_data:
+-            processors.save_processor_config(self.datastore, new_uuid, processor_config_data)
++            from changedetectionio.store import ConfigPublishError
++            try:
++                self.datastore.publish_watch_update(new_uuid, processor_config=processor_config_data)
++            except (ConfigPublishError, OSError, ValueError) as e:
++                logger.error(f"Failed to publish processor config for new watch {new_uuid}: {e}")
++                self.datastore.delete(new_uuid)
++                return f"Failed to save watch configuration: {e}", 500
+         if new_uuid:
+ # Dont queue because the scheduler will check that it hasnt been checked before anyway
+ #            worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': new_uuid}))
+diff --git a/changedetectionio/blueprint/ui/edit.py b/changedetectionio/blueprint/ui/edit.py
+index 27f4ec71..b801e8f9 100644
+--- a/changedetectionio/blueprint/ui/edit.py
++++ b/changedetectionio/blueprint/ui/edit.py
+@@ -206,6 +206,14 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
+ 
+         if request.method == 'POST' and form.validate():
+ 
++            # Optimistic-concurrency token: the config_version the rendered form
++            # was based on. A concurrent newer successful save makes this fail
++            # explicitly instead of silently overwriting the newer version.
++            try:
++                expected_config_version = int((request.form.get('config_version') or '').strip() or 0)
++            except ValueError:
++                expected_config_version = None
++
+             extra_update_obj = {
+                 'consecutive_filter_failures': 0,
+                 'last_error' : False
+@@ -216,10 +224,9 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
+ 
+             extra_update_obj['time_between_check'] = form.time_between_check.data
+ 
+-            # Handle processor-config-* fields separately (save to JSON, not datastore)
+-            # IMPORTANT: These must NOT be saved to url-watches.json, only to the processor-specific JSON file
++            # Handle processor-config-* fields separately (saved jointly with watch.json)
++            # IMPORTANT: These must NOT be saved to watch.json, only to the processor-specific JSON file
+             processor_config_data = processors.extract_processor_config_from_form_data(form.data)
+-            processors.save_processor_config(datastore, uuid, processor_config_data)
+ 
+             # Ignore text
+             form_ignore_text = form.ignore_text.data
+@@ -271,8 +278,27 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
+             watch_class = processors.get_custom_watch_obj_for_processor(form.data.get('processor'))
+             datastore.data['watching'][uuid] = watch_class(datastore_path=datastore.datastore_path, __datastore=datastore.data, default=datastore.data['watching'][uuid])
+ 
+-            # Save the watch immediately
+-            datastore.data['watching'][uuid].commit()
++            # Joint publication: watch.json AND the current processor's settings are
++            # staged and committed as one generation. Any failure leaves the old
++            # complete configuration in effect (on disk and in memory), surfaces a
++            # clear error here, and - crucially - does not queue an immediate check.
++            try:
++                datastore.publish_watch_update(
++                    uuid,
++                    processor_config=processor_config_data or None,
++                    expected_version=expected_config_version,
++                )
++            except Exception as e:
++                from changedetectionio.store import StaleConfigVersionError
++                if isinstance(e, StaleConfigVersionError):
++                    flash(gettext("This watch was saved in another tab or request since this page loaded. "
++                                 "Reload the page to see the newest configuration and apply your changes again."),
++                          'error')
++                else:
++                    logger.error(f"Failed to save watch {uuid} configuration: {e}")
++                    flash(gettext("Could not save the watch configuration: %(error)s. The previous settings remain active.",
++                                 error=str(e)), 'error')
++                return redirect(url_for('ui.ui_edit.edit_page', uuid=uuid))
+ 
+             flash(gettext("Updated watch - unpaused!") if request.args.get('unpause_on_save') else gettext("Updated watch."))
+ 
+@@ -469,8 +495,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
+ 
+             # Add all files in the watch data directory
+             if os.path.isdir(watch.data_dir):
++                from changedetectionio.store.config_transaction import _TX_PREFIX
+                 for f in Path(watch.data_dir).glob('*'):
+-                    if f.is_file() and f.name != 'watch.json':  # Skip watch.json since we already added it
++                    # Skip joint-publication debris (candidates/backups/markers)
++                    if f.is_file() and f.name != 'watch.json' and not f.name.startswith(_TX_PREFIX):
+                         zipObj.write(f,
+                                    arcname=os.path.join(uuid, f.name),
+                                    compress_type=zipfile.ZIP_DEFLATED,
+diff --git a/changedetectionio/blueprint/ui/templates/edit.html b/changedetectionio/blueprint/ui/templates/edit.html
+index 99b5d796..56bd572e 100644
+--- a/changedetectionio/blueprint/ui/templates/edit.html
++++ b/changedetectionio/blueprint/ui/templates/edit.html
+@@ -73,6 +73,8 @@
+         <form class="pure-form pure-form-stacked"
+               action="{{ url_for('ui.ui_edit.edit_page', uuid=uuid, next = request.args.get('next'), unpause_on_save = request.args.get('unpause_on_save'), tag = request.args.get('tag')) }}" method="POST">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
++             {# Joint-publish optimistic concurrency token: rejected when a concurrent newer save won #}
++             <input type="hidden" name="config_version" value="{{ watch.get('config_version', 0) }}">
+ 
+             <div class="tab-pane-inner" id="general">
+                 <fieldset>
+diff --git a/changedetectionio/model/Watch.py b/changedetectionio/model/Watch.py
+index 4423fdc6..6830edf7 100644
+--- a/changedetectionio/model/Watch.py
++++ b/changedetectionio/model/Watch.py
+@@ -267,6 +267,12 @@ class model(EntityPersistenceMixin, watch_base):
+             if not isinstance(self['restock'], Restock):
+                 self['restock'] = Restock(self['restock'])
+ 
++        # Monotonic generation of the jointly-published (watch.json + processor
++        # config) configuration. 0 for watches saved before this existed; every
++        # successful joint save bumps it by one. Used for optimistic concurrency
++        # (edit form hidden field / API If-Match) and crash recovery.
++        self.setdefault('config_version', 0)
++
+         # Be sure the cached timestamp is ready
+         bump = self.history
+ 
+@@ -369,15 +375,17 @@ class model(EntityPersistenceMixin, watch_base):
+ 
+         # Get list of processor config files to preserve
+         from changedetectionio.processors import find_processors
++        from changedetectionio.store.config_transaction import _TX_PREFIX
+         processor_names = [name for cls, name in find_processors()]
+         processor_config_files = {f"{name}.json" for name in processor_names}
+ 
+         # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
+         # But preserve processor config files (they're configuration, not history data)
++        # and in-flight joint-publication debris (candidates/backups/markers).
+         # Use glob not rglob here for safety.
+         for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
+             # Skip processor config files
+-            if item.name in processor_config_files:
++            if item.name in processor_config_files or item.name.startswith(_TX_PREFIX):
+                 continue
+             os.unlink(item)
+ 
+diff --git a/changedetectionio/processors/base.py b/changedetectionio/processors/base.py
+index e7730e28..727b30bb 100644
+--- a/changedetectionio/processors/base.py
++++ b/changedetectionio/processors/base.py
+@@ -330,45 +330,54 @@ class difference_detection_processor():
+         """
+         Read processor-specific JSON config file from watch data directory.
+ 
++        Goes through the joint-publication layer: while a save is mid-flight
++        this returns the previous COMPLETE generation (from the transaction
++        backup) rather than a possibly half-published file.
++
+         Args:
+-            filename: Name of JSON file (e.g., "visual_ssim_score.json")
++            filename: Name of JSON file (e.g., "restock_diff.json")
+ 
+         Returns:
+             dict: Parsed JSON data, or empty dict if file doesn't exist
+         """
+-        import json
+         import os
+ 
+         watch = self.datastore.data['watching'].get(self.watch_uuid)
+-        data_dir = watch.data_dir
+-
+-        if not data_dir:
++        if not watch or not watch.data_dir:
+             return {}
+ 
+-        filepath = self._resolve_watch_config_path(data_dir, filename)
++        filepath = self._resolve_watch_config_path(watch.data_dir, filename)
+         if not filepath:
+             return {}
+ 
+         if not os.path.isfile(filepath):
+             return {}
+ 
+-        try:
+-            with open(filepath, 'r', encoding='utf-8') as f:
+-                return json.load(f)
+-        except (json.JSONDecodeError, IOError) as e:
+-            logger.warning(f"Failed to read extra watch config {filename}: {e}")
+-            return {}
++        # Transaction-aware: hides prepared (not yet committed) generations.
++        datastore = getattr(self.datastore, 'read_watch_processor_config', None)
++        if callable(datastore):
++            return datastore(self.watch_uuid, filename)
++
++        # Fallback for datastores that do not provide the joint-publish layer
++        from changedetectionio.store.config_transaction import load_committed_json, strip_transaction_keys
++        return strip_transaction_keys(load_committed_json(watch.data_dir, filename))
+ 
+     def update_extra_watch_config(self, filename, data, merge=True):
+         """
+         Write processor-specific JSON config file to watch data directory.
+ 
++        Atomic (temp file + os.replace): a crash can never leave a truncated
++        JSON here that readers would silently fall back to defaults on.
++
++        NOTE: Watch save entry points (edit page, REST API) must persist this
++        TOGETHER with watch.json via datastore.publish_watch_update(); this
++        standalone writer remains for processor-internal use.
++
+         Args:
+             filename: Name of JSON file (e.g., "visual_ssim_score.json")
+             data: Dictionary to serialize as JSON
+             merge: If True, merge with existing data; if False, overwrite completely
+         """
+-        import json
+         import os
+ 
+         watch = self.datastore.data['watching'].get(self.watch_uuid)
+@@ -385,28 +394,21 @@ class difference_detection_processor():
+         if not filepath:
+             return
+ 
+-        try:
+-            # If merge is enabled, read existing data first
+-            existing_data = {}
+-            if merge and os.path.isfile(filepath):
+-                try:
+-                    with open(filepath, 'r', encoding='utf-8') as f:
+-                        existing_data = json.load(f)
+-                except (json.JSONDecodeError, IOError) as e:
+-                    logger.warning(f"Failed to read existing config for merge: {e}")
+-
+-            # Merge new data with existing
+-            if merge:
+-                existing_data.update(data)
+-                data_to_save = existing_data
+-            else:
+-                data_to_save = data
+-
+-            # Write the data
+-            with open(filepath, 'w', encoding='utf-8') as f:
+-                json.dump(data_to_save, f, indent=2)
+-        except IOError as e:
+-            logger.error(f"Failed to write extra watch config {filename}: {e}")
++        # Read the last committed version through the transaction-aware reader,
++        # so an in-flight joint publication cannot be merged into/overwritten.
++        existing_data = {}
++        if merge and os.path.isfile(filepath):
++            existing_data = self.get_extra_watch_config(filename)
++
++        if merge:
++            existing_data.update(data)
++            data_to_save = existing_data
++        else:
++            data_to_save = data
++
++        # Atomic single-file publication
++        from changedetectionio.store.file_saving_datastore import save_json_atomic
++        save_json_atomic(filepath, data_to_save, label=f"processor config {filename}", max_size_mb=1)
+ 
+     def get_raw_document_checksum(self):
+         checksum = None
+diff --git a/changedetectionio/store/__init__.py b/changedetectionio/store/__init__.py
+index 9885e172..77c778c6 100644
+--- a/changedetectionio/store/__init__.py
++++ b/changedetectionio/store/__init__.py
+@@ -39,6 +39,18 @@ from ..processors import get_custom_watch_obj_for_processor, find_processors
+ from .file_saving_datastore import (FileSavingDataStore, load_all_watches, load_all_tags, load_watch_from_file,
+                                     save_json_atomic)
+ from .updates import DatastoreUpdatesMixin
++from .config_transaction import (
++    WATCH_CONFIG_VERSION_KEY,
++    PROCESSOR_CONFIG_VERSION_KEY,
++    StaleConfigVersionError,
++    ConfigPublishError,
++    ConfigTransactionError,
++    joint_publish,
++    load_committed_json,
++    recover_all_config_transactions,
++    strip_transaction_keys,
++    watch_config_lock,
++)
+ 
+ # Because the server will run as a daemon and wont know the URL for notification links when firing off a notification
+ BASE_URL_NOT_SET_TEXT = '("Base URL" not set - see settings - notifications)'
+@@ -207,6 +219,11 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
+         # CRITICAL: Update datastore_path (was using old path from __init__)
+         self.datastore_path = datastore_path
+ 
++        # Resolve any interrupted joint watch.json + processor-config publications
++        # BEFORE any watch is loaded - a crash between the two writes must end in a
++        # deterministic rollback or completed commit, never a mixed generation.
++        recover_all_config_transactions(datastore_path)
++
+         # Initialize data structure
+         self.__data = App.model(datastore_path=datastore_path)
+         self.json_store_path = os.path.join(self.datastore_path, "changedetection.json")
+@@ -572,6 +589,138 @@ class ChangeDetectionStore(DatastoreUpdatesMixin, FileSavingDataStore):
+         # Immediate save
+         self.__data['watching'][uuid].commit()
+ 
++    # ------------------------------------------------------------------
++    # Joint publication of watch.json + the current processor's own config
++    # ------------------------------------------------------------------
++
++    # Filenames accepted for a processor config (same rule as save_processor_config)
++    _SAFE_PROCESSOR_NAME_RE = re.compile(r'[A-Za-z0-9_-]+')
++
++    def read_watch_processor_config(self, uuid, filename):
++        """Transaction-aware read of a watch's {processor}.json ({} if absent).
++
++        Serves the last COMPLETE generation while a publication is in flight.
++        Reserved transaction keys are stripped from the result.
++        """
++        watch = self.__data['watching'].get(uuid)
++        if not watch or not watch.data_dir:
++            return {}
++        return strip_transaction_keys(load_committed_json(watch.data_dir, filename))
++
++    def publish_watch_update(self, uuid, watch_updates=None, processor_config=None,
++                            expected_version=None):
++        """Jointly publish the main watch config and the processor's settings.
++
++        Both files are staged first and only published as one generation, so
++        the UI, GET API, check worker and a restarted process can never observe a
++        half-saved mix. On ANY failure the previous complete configuration keeps
++        working (disk is rolled back, the in-memory watch is restored) and the
++        exception propagates to the entry point - nothing queues an immediate
++        check after a failed save.
++
++        Args:
++            uuid: watch UUID
++            watch_updates: optional dict of main-config fields to apply to the
++                           live watch before publishing
++            processor_config: optional extracted processor_config_* payload
++                           (prefix removed). When falsy/None, only watch.json is
++                           published - the existing processor file stays valid.
++                           When provided, it is merged into the current
++                           processor's file (same merge semantics as before).
++            expected_version: config_version the edit/API request was based on;
++                           a concurrent newer successful save raises
++                           StaleConfigVersionError (HTTP 409 at the entry point).
++
++        Returns:
++            int: the new config_version
++
++        Raises:
++            StaleConfigVersionError, ConfigPublishError (or the underlying
++            OSError) on failure.
++        """
++        from copy import deepcopy
++
++        lock = watch_config_lock(self.datastore_path, uuid)
++        with lock:
++            watch = self.__data['watching'].get(uuid)
++            if not watch:
++                raise ConfigPublishError(f"Cannot publish watch {uuid}: watch not found")
++
++            # Park the full live object so any failure restores in-memory state to
++            # the old complete configuration too (worker keeps running old config).
++            snapshot = deepcopy(watch)
++            snapshot_class = watch.__class__
++
++            try:
++                current_version = int(watch.get(WATCH_CONFIG_VERSION_KEY) or 0)
++
++                if expected_version is not None:
++                    try:
++                        expected_version = int(expected_version)
++                    except (TypeError, ValueError):
++                        raise StaleConfigVersionError(current_version, expected_version)
++                    if expected_version != current_version:
++                        raise StaleConfigVersionError(current_version, expected_version)
++
++                if watch_updates:
++                    watch.update(watch_updates)
++
++                new_version = current_version + 1
++
++                # Main watch config (processor_config_* keys are excluded there)
++                watch_payload = watch._get_commit_data()
++                watch_payload[WATCH_CONFIG_VERSION_KEY] = new_version
++
++                parts = [{
++                    'final': 'watch.json',
++                    'payload': watch_payload,
++                    'version_key': WATCH_CONFIG_VERSION_KEY,
++                    'max_size_mb': 10,
++                }]
++
++                # Current processor's dedicated settings file
++                if processor_config:
++                    processor_name = watch.get('processor') or 'text_json_diff'
++                    if not self._SAFE_PROCESSOR_NAME_RE.fullmatch(processor_name or ''):
++                        raise ConfigPublishError(
++                            f"Refusing to publish processor config: unsafe processor name "
++                            f"{processor_name!r} on watch {uuid}"
++                        )
++
++                    filename = f'{processor_name}.json'
++                    # Merge with the currently committed file - nested keys (e.g.
++                    # {'restock_diff': {...}}) replace wholesale, flat keys merge,
++                    # exactly like the previous update_extra_watch_config(merge=True).
++                    existing = load_committed_json(watch.data_dir, filename)
++                    merged = strip_transaction_keys(existing)
++                    merged.update(processor_config)
++                    merged[PROCESSOR_CONFIG_VERSION_KEY] = new_version
++
++                    parts.append({
++                        'final': filename,
++                        'payload': merged,
++                        'version_key': PROCESSOR_CONFIG_VERSION_KEY,
++                        'max_size_mb': 1,
++                    })
++
++                joint_publish(watch.data_dir, parts, new_version)
++
++                # Bump in memory WITHOUT tripping was_edited: the configuration
++                # version is publication bookkeeping, not a user-edited field.
++                dict.__setitem__(watch, WATCH_CONFIG_VERSION_KEY, new_version)
++                logger.debug(f"Jointly published watch {uuid} configuration generation {new_version}")
++                return new_version
++
++            except BaseException:
++                # Restore the live object to the previous complete generation.
++                restored = snapshot_class(
++                    datastore_path=self.datastore_path,
++                    __datastore=self.__data,
++                    default=snapshot,
++                )
++                self.__data['watching'][uuid] = restored
++                raise
++
+     @property
+     def threshold_seconds(self):
+         seconds = 0
+diff --git a/changedetectionio/store/config_transaction.py b/changedetectionio/store/config_transaction.py
+new file mode 100644
+index 00000000..a13873c9
+--- /dev/null
++++ b/changedetectionio/store/config_transaction.py
+@@ -0,0 +1,470 @@
++"""
++Joint, crash-safe publication of a watch's two configuration files.
++
++A single watch edit can change BOTH:
++
++  - ``watch.json``           - the main watch configuration
++  - ``{processor}.json``     - the current processor's dedicated settings
++                               (e.g. restock_diff.json threshold settings)
++
++Writing one file and then the other as two independent "fire and forget" saves is
++not atomic: if the second write fails (disk full, quota, truncation by a crash
++mid-write) the entry point used to report success anyway, and after a restart the
++worker ran with a new main config paired with OLD processor settings - or with a
++truncated processor JSON that silently parsed as "no settings" (defaults).
++
++This module implements a small two-phase commit on top of atomic file renames:
++
++1. STAGE  - every participating file is written to a durable CANDIDATE temp file
++            (fsynced + closed). If a previous final file exists, an exact BACKUP
++            copy of it is parked next to it. Nothing visible changes.
++2. PREPARE - a commit marker (``.cfgtx-m-<generation>.json``) is written last,
++            describing candidates/backups and the generation. Readers can now
++            tell a transaction is in flight.
++3. PUBLISH - candidates are renamed over the final names with os.replace()
++            (processor config first, watch.json last).
++4. COMMIT  - the marker is flipped to state="committed", after which candidates
++            and backups are deleted.
++
++Crash / kill -9 recovery (see recover_config_transactions) is deterministic:
++
++  - marker state="committed" -> finish publishing any part whose final file does
++    not yet carry the marker generation, then clean up (recover the commit)
++  - marker state="prepared"  -> every replaced final is restored from its
++    backup, candidates/marker are deleted (roll back); finals that were never
++    replaced simply stay untouched
++  - no marker, stray files   -> pure staging debris, delete it
++
++Readers never see a mixed generation while a "prepared" marker is present:
++load_committed_json() serves the backup of the in-flight part, i.e. the last
++complete configuration.
++
++All files live inside the watch's own data directory, so every rename is
++same-filesystem and atomic on POSIX and Windows.
++"""
++
++import glob
++import json
++import os
++import shutil
++import tempfile
++import threading
++
++from loguru import logger
++
++try:
++    import orjson
++
++    def _dumps(data_dict):
++        return orjson.dumps(data_dict, option=orjson.OPT_INDENT_2)
++
++    def _loads(raw):
++        return orjson.loads(raw)
++
++except ImportError:
++    def _dumps(data_dict):
++        return json.dumps(data_dict, indent=2, ensure_ascii=False).encode('utf-8')
++
++    def _loads(raw):
++        return json.loads(raw.decode('utf-8'))
++
++# Version of the joint configuration. Stored on the watch model (watch.json) and
++# inside every committed processor config file (reserved, underscore-prefixed key).
++WATCH_CONFIG_VERSION_KEY = 'config_version'
++PROCESSOR_CONFIG_VERSION_KEY = '__config_version__'
++
++STATE_PREPARED = 'prepared'
++STATE_COMMITTED = 'committed'
++
++# All transaction debris shares this prefix inside the watch data directory.
++_TX_PREFIX = '.cfgtx-'
++_MARKER_TEMPLATE = _TX_PREFIX + 'm-{generation}.json'
++_CANDIDATE_TEMPLATE = _TX_PREFIX + 'c-{index}-{generation}'
++_BACKUP_TEMPLATE = _TX_PREFIX + 'b-{index}-{generation}'
++
++# Serializes transactions for the SAME watch across threads inside one process.
++# Keyed by (datastore_path, watch_uuid); multi-process datastores are unsupported
++# elsewhere in the application as well.
++_locks_guard = threading.Lock()
++_tx_locks: dict = {}
++
++
++def watch_config_lock(datastore_path, watch_uuid):
++    """Return the process-wide reentrant lock guarding one watch directory."""
++    key = (os.path.realpath(datastore_path), str(watch_uuid))
++    with _locks_guard:
++        lock = _tx_locks.get(key)
++        if lock is None:
++            lock = threading.RLock()
++            _tx_locks[key] = lock
++        return lock
++
++
++class ConfigTransactionError(Exception):
++    """Base class for joint configuration publication failures."""
++
++
++class StaleConfigVersionError(ConfigTransactionError):
++    """The save was based on an older configuration generation.
++
++    Raised when the caller-supplied expected version no longer matches the
++    watch's current config_version - a concurrent newer save won.
++    """
++
++    def __init__(self, current_version, expected_version):
++        self.current_version = current_version
++        self.expected_version = expected_version
++        super().__init__(
++            f"Watch configuration changed since it was loaded "
++            f"(current generation: {current_version}, submitted: {expected_version}). "
++            f"Reload the watch and try again."
++        )
++
++
++class ConfigPublishError(ConfigTransactionError):
++    """Staging or publishing one of the configuration files failed."""
++
++
++# ----------------------------------------------------------------------------
++# Low level file helpers
++# ----------------------------------------------------------------------------
++
++def _safe_part_name(filename):
++    """Reject any filename that is not a bare file inside the watch directory."""
++    if not filename or filename in ('.', '..'):
++        return False
++    if filename != os.path.basename(filename) or '/' in filename or '\\' in filename:
++        return False
++    return True
++
++
++def _write_bytes_fsync(file_path, data):
++    """Write bytes to an exact path, fsync, close. Caller chose the name."""
++    with open(file_path, 'wb') as f:
++        f.write(data)
++        f.flush()
++        os.fsync(f.fileno())
++
++
++def _copy_backup(final_path, backup_path):
++    """Byte-copy an existing final file to its backup and fsync it."""
++    with open(final_path, 'rb') as src:
++        data = src.read()
++    _write_bytes_fsync(backup_path, data)
++
++
++def _write_candidate(data_dir, index, generation, payload):
++    """Stage payload at a deterministic candidate path (same directory)."""
++    candidate_path = os.path.join(
++        data_dir, _CANDIDATE_TEMPLATE.format(index=index, generation=generation)
++    )
++    _write_bytes_fsync(candidate_path, payload)
++    return candidate_path
++
++
++def _find_markers(data_dir):
++    """Return parsed marker dicts for every transaction marker in a dir."""
++    markers = []
++    for marker_path in sorted(glob.glob(os.path.join(data_dir, _TX_PREFIX + 'm-*.json'))):
++        try:
++            with open(marker_path, 'rb') as f:
++                marker = _loads(f.read())
++            if isinstance(marker, dict) and marker.get('generation') is not None:
++                marker['__path'] = marker_path
++                markers.append(marker)
++        except (OSError, ValueError) as e:
++            logger.warning(f"Unreadable config transaction marker {marker_path}: {e}")
++    return markers
++
++
++def _remove_quiet(path):
++    if not path:
++        return
++    try:
++        os.unlink(path)
++    except FileNotFoundError:
++        pass
++    except OSError as e:
++        logger.warning(f"Could not remove transaction file {path}: {e}")
++
++
++def _cleanup_parts(data_dir, parts, marker_path=None):
++    for part in parts:
++        for key in ('candidate', 'backup'):
++            name = part.get(key)
++            if name:
++                _remove_quiet(os.path.join(data_dir, os.path.basename(name)))
++    if marker_path:
++        _remove_quiet(marker_path)
++
++
++def _final_has_generation(data_dir, part, generation):
++    """True when the part's final file parses and carries `generation`."""
++    final_path = os.path.join(data_dir, part['final'])
++    try:
++        with open(final_path, 'rb') as f:
++            data = _loads(f.read())
++        return isinstance(data, dict) and data.get(part['version_key']) == generation
++    except (OSError, ValueError):
++        return False
++
++
++def _finish_commit(data_dir, marker, marker_path):
++    """Replace any final file that is not yet at the marker generation."""
++    for part in marker.get('parts', []):
++        candidate = part.get('candidate')
++        if not candidate:
++            continue
++        candidate_path = os.path.join(data_dir, os.path.basename(candidate))
++        final_path = os.path.join(data_dir, part['final'])
++        if not _final_has_generation(data_dir, part, marker['generation']):
++            os.replace(candidate_path, final_path)
++    _cleanup_parts(data_dir, marker.get('parts', []), marker_path)
++
++
++def _rollback(data_dir, marker, marker_path):
++    """Restore every replaced final from its backup, then discard debris."""
++    failed_parts = set()
++    for index, part in enumerate(marker.get('parts', [])):
++        backup = part.get('backup')
++        if not backup:
++            continue
++        backup_path = os.path.join(data_dir, os.path.basename(backup))
++        final_path = os.path.join(data_dir, part['final'])
++        try:
++            # The backup only exists for parts that changed; replacing is a no-op
++            # byte-wise when the final file was never switched to its candidate.
++            if os.path.exists(backup_path):
++                os.replace(backup_path, final_path)
++        except OSError as e:
++            failed_parts.add(index)
++            logger.error(
++                f"Rollback failed for {part.get('final')} in {data_dir}: {e}; "
++                f"backup retained at {backup_path}"
++            )
++
++    # Candidates always go. Backups go when their restore replace consumed them;
++    # a backup for a part whose restore raised is retained for the next startup
++    # attempt / manual inspection.
++    for index, part in enumerate(marker.get('parts', [])):
++        candidate = part.get('candidate')
++        if candidate:
++            _remove_quiet(os.path.join(data_dir, os.path.basename(candidate)))
++        backup = part.get('backup')
++        if backup and index not in failed_parts:
++            _remove_quiet(os.path.join(data_dir, os.path.basename(backup)))
++    _remove_quiet(marker_path)
++
++
++def recover_config_transaction(data_dir):
++    """Deterministically resolve one watch directory's interrupted transaction.
++
++    Called during datastore startup for every watch directory. Safe to call
++    repeatedly (idempotent).
++    """
++    if not os.path.isdir(data_dir):
++        return
++
++    markers = _find_markers(data_dir)
++    for marker in markers:
++        marker_path = marker['__path']
++        generation = marker.get('generation')
++        state = marker.get('state')
++        try:
++            if state == STATE_COMMITTED:
++                logger.info(f"Recovering interrupted config commit (generation {generation}) in {data_dir}")
++                _finish_commit(data_dir, marker, marker_path)
++            else:
++                logger.warning(
++                    f"Rolling back incomplete config publication (generation {generation}) in {data_dir}"
++                )
++                _rollback(data_dir, marker, marker_path)
++        except OSError as e:
++            # Leave everything in place for the next startup attempt rather than
++            # guessing - mixed generations must never be treated as success.
++            logger.error(f"Config transaction recovery error in {data_dir}: {e}")
++            return
++
++    # No marker (crash before PREPARE, or after a completed cleanup): staging
++    # debris is safe to delete, finals were never touched.
++    for debris in glob.glob(os.path.join(data_dir, _TX_PREFIX + '*')):
++        _remove_quiet(debris)
++
++
++def recover_all_config_transactions(datastore_path):
++    """Run recovery over every immediate subdirectory of the datastore."""
++    if not datastore_path or not os.path.isdir(datastore_path):
++        return
++    try:
++        entries = os.scandir(datastore_path)
++    except FileNotFoundError:
++        return
++    with entries:
++        for entry in entries:
++            try:
++                if entry.is_dir() and glob.glob(os.path.join(entry.path, _TX_PREFIX + '*')):
++                    recover_config_transaction(entry.path)
++            except OSError:
++                continue
++
++
++# ----------------------------------------------------------------------------
++# Publication
++# ----------------------------------------------------------------------------
++
++def joint_publish(data_dir, parts, generation):
++    """Publish several JSON config files as one configuration generation.
++
++    Args:
++        data_dir: watch data directory (all files live in it)
++        parts: ordered list of dicts:
++               {"final": "watch.json", "payload": dict,
++                "version_key": "config_version", "max_size_mb": 10}
++               The LAST part should be watch.json (published last).
++        generation: integer generation embedded into every payload
++
++    Raises:
++        ConfigPublishError on any staging/rename failure after best-effort
++        rollback. On raise, the on-disk finals hold the previous complete
++        configuration (or are restored to it).
++    """
++    os.makedirs(data_dir, exist_ok=True)
++
++    # Another interrupted transaction from a crashed process cannot be resolved
++    # safely by guessing - finish/roll it back first.
++    if _find_markers(data_dir):
++        recover_config_transaction(data_dir)
++        if _find_markers(data_dir):
++            raise ConfigPublishError(
++                f"An unresolved config transaction marker remains in {data_dir}; "
++                f"refusing to publish generation {generation}"
++            )
++
++    staged = []
++    marker_path = os.path.join(data_dir, _MARKER_TEMPLATE.format(generation=generation))
++    try:
++        # --- Phase 1: stage candidates + backups (nothing visible yet) ---
++        for index, part in enumerate(parts):
++            final_name = part['final']
++            if not _safe_part_name(final_name):
++                raise ConfigPublishError(f"Unsafe config file name: {final_name!r}")
++
++            payload = dict(part['payload'])
++            payload[part['version_key']] = generation
++            data = _dumps(payload)
++
++            max_size = part.get('max_size_mb', 1) * 1024 * 1024
++            if len(data) > max_size:
++                raise ConfigPublishError(
++                    f"{final_name} data is unexpectedly large: "
++                    f"{len(data) / 1024 / 1024:.2f}MB (max {part.get('max_size_mb', 1)}MB)"
++                )
++
++            final_path = os.path.join(data_dir, final_name)
++            staged_part = {
++                'final': final_name,
++                'version_key': part['version_key'],
++                'candidate': None,
++                'backup': None,
++            }
++
++            # Park an exact copy of the previous final so PREPARED can roll back.
++            if os.path.exists(final_path):
++                backup_path = os.path.join(
++                    data_dir, _BACKUP_TEMPLATE.format(index=index, generation=generation)
++                )
++                _copy_backup(final_path, backup_path)
++                staged_part['backup'] = os.path.basename(backup_path)
++
++            staged_part['candidate'] = os.path.basename(
++                _write_candidate(data_dir, index, generation, data)
++            )
++            staged.append(staged_part)
++
++        # --- Phase 2: commit marker makes the transaction discoverable ---
++        marker = {
++            'generation': generation,
++            'state': STATE_PREPARED,
++            'parts': [{k: v for k, v in p.items() if k in ('final', 'version_key', 'candidate', 'backup')}
++                      for p in staged],
++        }
++        marker_tmp = marker_path + '.tmp'
++        _write_bytes_fsync(marker_tmp, _dumps(marker))
++        os.replace(marker_tmp, marker_path)
++
++        # --- Phase 3: publish. Processor parts first, watch.json LAST. ---
++        for part in staged:
++            os.replace(
++                os.path.join(data_dir, part['candidate']),
++                os.path.join(data_dir, part['final'])
++            )
++
++        # --- Phase 4: declare committed and clean up ---
++        marker['state'] = STATE_COMMITTED
++        marker_tmp = marker_path + '.tmp'
++        _write_bytes_fsync(marker_tmp, _dumps(marker))
++        os.replace(marker_tmp, marker_path)
++        _cleanup_parts(data_dir, staged, marker_path)
++
++    except Exception as e:
++        # Try to make the live on-disk state immediately consistent; startup
++        # recovery remains the authoritative deterministic fallback.
++        try:
++            if os.path.exists(marker_path):
++                _rollback(data_dir,
++                         {'parts': staged, 'generation': generation},
++                         marker_path)
++            else:
++                _cleanup_parts(data_dir, staged)
++        except Exception as cleanup_error:
++            logger.error(f"Error while rolling back failed config transaction in {data_dir}: {cleanup_error}")
++
++        if isinstance(e, ConfigTransactionError):
++            raise
++        raise ConfigPublishError(f"Failed to jointly publish watch configuration: {e}") from e
++
++
++# ----------------------------------------------------------------------------
++# Transaction-aware reads
++# ----------------------------------------------------------------------------
++
++def load_committed_json(data_dir, filename):
++    """Load a committed JSON config, hiding in-flight (prepared) generations.
++
++    While a transaction is PREPARED but not yet COMMITTED, finals may be a mix
++    of two generations. Serve that part's backup (the last complete version)
++    instead. Returns {} when the file does not exist.
++
++    Note: startup recovery runs before watches load, so under normal operation
++    no marker is present; this only covers the microsecond publish window and
++    external readers.
++    """
++    if not _safe_part_name(filename):
++        logger.error(f"Refusing unsafe config file name: {filename!r}")
++        return {}
++
++    source_path = os.path.join(data_dir, filename)
++    try:
++        for marker in _find_markers(data_dir):
++            if marker.get('state') != STATE_PREPARED:
++                continue
++            for part in marker.get('parts', []):
++                if part.get('final') == filename and part.get('backup'):
++                    backup_path = os.path.join(data_dir, os.path.basename(part['backup']))
++                    if os.path.exists(backup_path):
++                        source_path = backup_path
++        if not os.path.isfile(source_path):
++            return {}
++        with open(source_path, 'rb') as f:
++            data = _loads(f.read())
++        return data if isinstance(data, dict) else {}
++    except (OSError, ValueError) as e:
++        logger.warning(f"Failed to read committed watch config {filename}: {e}")
++        return {}
++
++
++def strip_transaction_keys(config_dict):
++    """Drop reserved transaction metadata from a loaded processor config."""
++    if not isinstance(config_dict, dict):
++        return {}
++    return {k: v for k, v in config_dict.items() if not k.startswith('__')}
+diff --git a/changedetectionio/tests/test_joint_publish_entrypoints.py b/changedetectionio/tests/test_joint_publish_entrypoints.py
+new file mode 100644
+index 00000000..933fe52d
+--- /dev/null
++++ b/changedetectionio/tests/test_joint_publish_entrypoints.py
+@@ -0,0 +1,233 @@
++#!/usr/bin/env python3
++"""
++End-to-end guarantees for the joint publication of watch.json + processor config
++through the actual edit page and REST API entry points.
++
++- Both files of one save converge to one generation (UI edit, GET API, restart)
++- A stale base version is rejected from the API (If-Match) and the edit form
++- Any publish failure returns an explicit error, leaves the old complete config
++  on disk, and does not queue an immediate recheck
++- First-time creation persists the processor settings together with watch.json
++"""
++
++import json
++import os
++
++from flask import url_for
++
++from changedetectionio.store import ChangeDetectionStore
++from changedetectionio.store.config_transaction import WATCH_CONFIG_VERSION_KEY
++
++
++def _watch_json(datastore, uuid):
++    path = os.path.join(datastore.data['watching'][uuid].data_dir, 'watch.json')
++    with open(path, 'r', encoding='utf-8') as f:
++        return json.load(f)
++
++
++def _restock_json(datastore, uuid):
++    path = os.path.join(datastore.data['watching'][uuid].data_dir, 'restock_diff.json')
++    with open(path, 'r', encoding='utf-8') as f:
++        return json.load(f)
++
++
++def _drain_queue():
++    from changedetectionio.flask_app import update_q
++    while not update_q.empty():
++        try:
++            update_q.get_nowait()
++        except Exception:
++            break
++
++
++def test_api_put_joint_publish_and_if_match_conflict(client, live_server):
++    datastore = client.application.config.get('DATASTORE')
++    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
++    headers = {'content-type': 'application/json', 'x-api-key': api_key}
++
++    res = client.post(
++        url_for("createwatch"),
++        data=json.dumps({
++            'url': 'http://example.com/',
++            'processor': 'restock_diff',
++            'processor_config_restock_diff': {'follow_price_changes': False},
++        }),
++        headers=headers,
++    )
++    assert res.status_code == 201, res.data
++    uuid = res.json['uuid']
++
++    # The first generation exists on BOTH files
++    watch_disk = _watch_json(datastore, uuid)
++    restock_disk = _restock_json(datastore, uuid)
++    assert watch_disk[WATCH_CONFIG_VERSION_KEY] >= 1
++    assert restock_disk['__config_version__'] == watch_disk[WATCH_CONFIG_VERSION_KEY]
++    assert restock_disk['restock_diff']['follow_price_changes'] is False
++    # No transaction debris
++    debris = [n for n in os.listdir(datastore.data['watching'][uuid].data_dir) if n.startswith('.cfgtx-')]
++    assert debris == []
++
++    version = watch_disk[WATCH_CONFIG_VERSION_KEY]
++
++    # A stale If-Match is rejected with 409, cannot clobber the newer save
++    res = client.put(
++        url_for("watch", uuid=uuid),
++        data=json.dumps({'title': 'Late stale request'}),
++        headers={**headers, 'If-Match': str(version - 1)},
++    )
++    assert res.status_code == 409, res.data
++    assert _watch_json(datastore, uuid).get('title') != 'Late stale request'
++
++    # Matching If-Match publishes
++    res = client.put(
++        url_for("watch", uuid=uuid),
++        data=json.dumps({
++            'title': 'Joint title',
++            'processor_config_restock_diff': {'in_stock_processing': 'all_changes'},
++        }),
++        headers={**headers, 'If-Match': str(version)},
++    )
++    assert res.status_code == 200, res.data
++
++    # GET API converges to the same new generation
++    res = client.get(url_for("watch", uuid=uuid), headers={'x-api-key': api_key})
++    assert res.status_code == 200
++    data = res.json
++    assert data['title'] == 'Joint title'
++    assert data[WATCH_CONFIG_VERSION_KEY] == version + 1
++    assert data['processor_config_restock_diff']['in_stock_processing'] == 'all_changes'
++
++
++def test_api_put_failure_keeps_old_config_and_does_not_queue(client, live_server, monkeypatch):
++    datastore = client.application.config.get('DATASTORE')
++    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
++
++    uuid = datastore.add_watch(url='http://example.com/', extras={'processor': 'restock_diff'})
++    datastore.publish_watch_update(
++        uuid, processor_config={'restock_diff': {'in_stock_processing': 'in_stock_only'}}
++    )
++
++    before = _watch_json(datastore, uuid)
++    before_restock = _restock_json(datastore, uuid)
++    _drain_queue()
++
++    def explode(*args, **kwargs):
++        raise OSError("simulated disk failure during joint publish")
++
++    monkeypatch.setattr(datastore, 'publish_watch_update', explode)
++
++    res = client.put(
++        url_for("watch", uuid=uuid),
++        data=json.dumps({
++            'title': 'Should not persist',
++            'processor_config_restock_diff': {'in_stock_processing': 'off'},
++        }),
++        headers={'content-type': 'application/json', 'x-api-key': api_key},
++    )
++    assert res.status_code == 500, res.data
++
++    # Old COMPLETE config still on disk
++    assert _watch_json(datastore, uuid)['title'] == before['title']
++    assert _restock_json(datastore, uuid)['restock_diff'] == before_restock['restock_diff']
++    debris = [n for n in os.listdir(datastore.data['watching'][uuid].data_dir) if n.startswith('.cfgtx-')]
++    assert debris == []
++
++    # No immediate check was queued by the failed save
++    from changedetectionio.flask_app import update_q
++    assert update_q.empty(), "a failed save must not queue an immediate recheck"
++
++
++def test_edit_page_stale_form_version_is_rejected(client, live_server):
++    datastore = client.application.config.get('DATASTORE')
++    uuid = datastore.add_watch(url='http://example.com/', extras={'title': 'Keep me'})
++
++    # A newer joint save wins before the stale form posts
++    datastore.publish_watch_update(uuid, watch_updates={'title': 'Newer saved title'})
++
++    res = client.post(
++        url_for("ui.ui_edit.edit_page", uuid=uuid),
++        data={
++            'config_version': '0',
++            'url': 'http://example.com/',
++            'title': 'Stale overwrite',
++            'time_between_check-hours': '2',
++            'time_between_check-minutes': '30',
++            'fetch_backend': 'html_requests',
++            'method': 'GET',
++            'ignore_text': '',
++        },
++        follow_redirects=True,
++    )
++    assert res.status_code == 200
++    assert b"another tab or request" in res.data, "a stale edit save should show a clear conflict error"
++    assert _watch_json(datastore, uuid)['title'] == 'Newer saved title'
++
++
++def test_edit_page_joint_publish_survives_restart(client, live_server):
++    datastore = client.application.config.get('DATASTORE')
++    uuid = datastore.add_watch(url='http://example.com/', extras={'processor': 'restock_diff'})
++
++    res = client.post(
++        url_for("ui.ui_edit.edit_page", uuid=uuid),
++        data={
++            'config_version': '0',
++            'url': 'http://example.com/',
++            'title': 'UI joint title',
++            'time_between_check-hours': '2',
++            'time_between_check-minutes': '30',
++            'fetch_backend': 'html_requests',
++            'method': 'GET',
++            'ignore_text': '',
++            'processor_config_restock_diff-in_stock_processing': 'all_changes',
++            'processor_config_restock_diff-follow_price_changes': 'y',
++            'processor_config_restock_diff-price_change_min': '42.5',
++            'processor_config_restock_diff-price_change_max': '',
++            'processor_config_restock_diff-price_change_threshold_percent': '',
++        },
++        follow_redirects=True,
++    )
++    assert res.status_code == 200
++    assert b"Updated watch" in res.data
++
++    version = _watch_json(datastore, uuid)[WATCH_CONFIG_VERSION_KEY]
++    restock = _restock_json(datastore, uuid)
++    assert restock['__config_version__'] == version
++    assert restock['restock_diff']['price_change_min'] == 42.5
++    assert restock['restock_diff']['in_stock_processing'] == 'all_changes'
++
++    # The edit page GET converges on the same committed settings
++    res = client.get(url_for("ui.ui_edit.edit_page", uuid=uuid))
++    assert res.status_code == 200
++    assert b'value="42.5"' in res.data, "edit form must prefill the jointly saved threshold"
++
++    # Switch processor away and back - the dedicated settings must survive
++    res = client.post(
++        url_for("ui.ui_edit.edit_page", uuid=uuid),
++        data={
++            'config_version': str(version),
++            'url': 'http://example.com/',
++            'title': 'UI joint title',
++            'time_between_check-hours': '2',
++            'time_between_check-minutes': '30',
++            'fetch_backend': 'html_requests',
++            'method': 'GET',
++            'processor': 'text_json_diff',
++            'ignore_text': '',
++        },
++        follow_redirects=True,
++    )
++    assert b"Updated watch" in res.data
++    # restock_diff.json is still on disk (dedicated settings are per-processor)
++    assert _restock_json(datastore, uuid)['restock_diff']['price_change_min'] == 42.5
++
++    # Restart: one consistent generation visible
++    datastore2 = ChangeDetectionStore(datastore_path=datastore.datastore_path,
++                                    include_default_watches=False)
++    datastore2.stop_thread = True
++    watch = datastore2.data['watching'][uuid]
++    assert watch['title'] == 'UI joint title'
++    assert watch[WATCH_CONFIG_VERSION_KEY] >= version
++    cfg = datastore2.read_watch_processor_config(uuid, 'restock_diff.json')
++    assert cfg['restock_diff']['price_change_min'] == 42.5
++    debris = [n for n in os.listdir(watch.data_dir) if n.startswith('.cfgtx-')]
++    assert debris == []
+diff --git a/changedetectionio/tests/unit/test_watch_joint_publish.py b/changedetectionio/tests/unit/test_watch_joint_publish.py
+new file mode 100644
+index 00000000..0d327465
+--- /dev/null
++++ b/changedetectionio/tests/unit/test_watch_joint_publish.py
+@@ -0,0 +1,375 @@
++#!/usr/bin/env python3
++"""
++Unit tests for the joint publication of watch.json + {processor}.json.
++
++Covers:
++- Both files land as one generation (same version, no transaction debris)
++- Processor settings merge and per-processor retention when switching processors
++- Stale optimistic version is rejected
++- Write/close/publish failure rolls disk AND memory back to the old complete config
++- Startup recovery: prepared marker rolls back, committed marker completes the commit
++- Readers never observe a prepared (half-published) generation
++- Concurrent saves can never let a late request overwrite a newer success
++"""
++
++import glob
++import json
++import os
++import tempfile
++import threading
++import unittest
++from unittest import mock
++
++from changedetectionio.store import ChangeDetectionStore
++from changedetectionio.store import config_transaction as ctx
++from changedetectionio.store.config_transaction import (
++    WATCH_CONFIG_VERSION_KEY,
++    PROCESSOR_CONFIG_VERSION_KEY,
++    StaleConfigVersionError,
++    ConfigPublishError,
++    _TX_PREFIX,
++    _MARKER_TEMPLATE,
++    _CANDIDATE_TEMPLATE,
++)
++
++
++class JointPublishTestBase(unittest.TestCase):
++    def setUp(self):
++        self.datastore_path = tempfile.mkdtemp()
++        self.store = ChangeDetectionStore(datastore_path=self.datastore_path,
++                                         include_default_watches=False)
++        self.uuid = self.store.add_watch(url='https://example.com/',
++                                        extras={'processor': 'restock_diff',
++                                                'title': 'Original'})
++        self.watch = self.store.data['watching'][self.uuid]
++        self.data_dir = self.watch.data_dir
++
++    def tearDown(self):
++        self.store.stop_thread = True
++
++    def _read(self, name):
++        with open(os.path.join(self.data_dir, name), 'rb') as f:
++            return json.loads(f.read())
++
++    def _debris(self):
++        return [os.path.basename(p) for p in glob.glob(os.path.join(self.data_dir, _TX_PREFIX + '*'))]
++
++
++class TestJointPublishHappyPath(JointPublishTestBase):
++
++    def test_both_files_publish_together_at_one_generation(self):
++        version = self.store.publish_watch_update(
++            self.uuid,
++            watch_updates={'title': 'New title'},
++            processor_config={'restock_diff': {'in_stock_processing': 'all_changes',
++                                             'follow_price_changes': False}},
++        )
++        self.assertEqual(version, 1)
++
++        watch_disk = self._read('watch.json')
++        restock_disk = self._read('restock_diff.json')
++
++        # One shared generation
++        self.assertEqual(watch_disk[WATCH_CONFIG_VERSION_KEY], 1)
++        self.assertEqual(restock_disk.pop(PROCESSOR_CONFIG_VERSION_KEY), 1)
++        self.assertEqual(restock_disk['restock_diff'],
++                         {'in_stock_processing': 'all_changes',
++                          'follow_price_changes': False})
++
++        # In-memory state matches
++        self.assertEqual(self.watch[WATCH_CONFIG_VERSION_KEY], 1)
++        self.assertEqual(self.watch['title'], 'New title')
++
++        # Candidates/backups/markers are all cleaned up
++        self.assertEqual(self._debris(), [])
++
++    def test_processor_config_optional_rewrites_only_watch_json(self):
++        self.store.publish_watch_update(self.uuid, watch_updates={'title': 'No proc part'})
++        self.assertFalse(os.path.exists(os.path.join(self.data_dir, 'restock_diff.json')))
++        self.assertEqual(self._debris(), [])
++
++    def test_restart_sees_exactly_one_consistent_generation(self):
++        from changedetectionio.store import ChangeDetectionStore
++
++        self.store.publish_watch_update(
++            self.uuid,
++            watch_updates={'title': 'Persisted'},
++            processor_config={'restock_diff': {'in_stock_processing': 'off'}},
++        )
++
++        reloaded = ChangeDetectionStore(datastore_path=self.datastore_path,
++                                       include_default_watches=False)
++        reloaded.stop_thread = True
++        watch = reloaded.data['watching'][self.uuid]
++        self.assertEqual(watch['title'], 'Persisted')
++        self.assertEqual(watch[WATCH_CONFIG_VERSION_KEY], 1)
++
++        restock = reloaded.read_watch_processor_config(self.uuid, 'restock_diff.json')
++        self.assertEqual(restock['restock_diff']['in_stock_processing'], 'off')
++        self.assertEqual(self._debris(), [])
++
++
++class TestProcessorSwitchingAndMerge(JointPublishTestBase):
++
++    def test_each_processor_keeps_its_own_settings_when_switching(self):
++        # Restock settings
++        self.store.publish_watch_update(
++            self.uuid,
++            processor_config={'restock_diff': {'in_stock_processing': 'all_changes'}},
++        )
++        # Switch to the text processor and save (no dedicated config in this request)
++        self.store.publish_watch_update(self.uuid,
++                                       watch_updates={'processor': 'text_json_diff'})
++        # restock_diff.json must survive untouched
++        restock = self._read('restock_diff.json')
++        self.assertEqual(restock['restock_diff']['in_stock_processing'], 'all_changes')
++        self.assertFalse(os.path.exists(os.path.join(self.data_dir, 'text_json_diff.json')))
++
++        # Switch back to restock and merge one more key
++        self.store.publish_watch_update(
++            self.uuid,
++            watch_updates={'processor': 'restock_diff'},
++            processor_config={'restock_diff': {'follow_price_changes': False}},
++        )
++        restock = self.store.read_watch_processor_config(self.uuid, 'restock_diff.json')
++        # Wholesale nested replacement semantics: new nested dict wins...
++        self.assertEqual(restock['restock_diff'], {'follow_price_changes': False})
++
++    def test_flat_processor_keys_still_merge(self):
++        # The legacy API shape stored flat keys directly in the processor file
++        self.store.publish_watch_update(
++            self.uuid,
++            processor_config={'price_threshold': 10.0},
++        )
++        self.store.publish_watch_update(
++            self.uuid,
++            processor_config={'in_stock_only': True},
++        )
++        cfg = self.store.read_watch_processor_config(self.uuid, 'restock_diff.json')
++        self.assertEqual(cfg.get('price_threshold'), 10.0)
++        self.assertEqual(cfg.get('in_stock_only'), True)
++
++
++class TestStaleVersion(JointPublishTestBase):
++
++    def test_expected_version_must_match_current(self):
++        self.store.publish_watch_update(self.uuid, watch_updates={'title': 'v1'})
++        with self.assertRaises(StaleConfigVersionError):
++            self.store.publish_watch_update(self.uuid,
++                                          watch_updates={'title': 'stale'},
++                                          expected_version=0)
++        # Newer success is intact
++        self.assertEqual(self.watch['title'], 'v1')
++        self.assertEqual(self._read('watch.json')['title'], 'v1')
++
++    def test_concurrent_saves_cannot_let_a_late_request_overwrite(self):
++        barrier = threading.Barrier(2)
++        results = []
++
++        def save(title):
++            barrier.wait()
++            try:
++                self.store.publish_watch_update(
++                    self.uuid,
++                    watch_updates={'title': title},
++                    expected_version=0,
++                )
++                results.append('ok')
++            except StaleConfigVersionError:
++                results.append('stale')
++            except Exception as e:  # pragma: no cover - surfaces real bugs
++                results.append(f'error:{e!r}')
++
++        threads = [threading.Thread(target=save, args=('A-title',)),
++                   threading.Thread(target=save, args=('B-title',))]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        self.assertEqual(sorted(results), ['ok', 'stale'])
++        self.assertEqual(self._read('watch.json')[WATCH_CONFIG_VERSION_KEY], 1)
++        self.assertEqual(self._debris(), [])
++
++
++class TestFailureRollback(JointPublishTestBase):
++
++    def test_failure_after_first_rename_restores_old_complete_config(self):
++        # Establish a complete generation 1 first
++        self.store.publish_watch_update(
++            self.uuid,
++            watch_updates={'title': 'Generation one'},
++            processor_config={'restock_diff': {'in_stock_processing': 'in_stock_only'}},
++        )
++
++        real_replace = os.replace
++
++        def fail_on_watch_final(src, dst):
++            if os.path.basename(str(dst)) == 'watch.json':
++                raise OSError("simulated rename failure (quota / permission)")
++            return real_replace(src, dst)
++
++        # Suppress the immediate in-process rollback so we can exercise STARTUP
++        # recovery of the exact "process died between the two writes" state.
++        original_rollback = ctx._rollback
++        ctx._rollback = lambda *a, **k: (_ for _ in ()).throw(
++            OSError("rollback suppressed to simulate process death"))
++
++        with mock.patch('changedetectionio.store.config_transaction.os.replace',
++                        side_effect=fail_on_watch_final):
++            with self.assertRaises(ConfigPublishError):
++                self.store.publish_watch_update(
++                    self.uuid,
++                    watch_updates={'title': 'Generation two'},
++                    processor_config={'restock_diff': {'in_stock_processing': 'off'}},
++                )
++
++        ctx._rollback = original_rollback
++
++        # Disk is currently mixed: processor file already at generation 2, marker
++        # still "prepared", watch.json still generation 1.
++        marker = glob.glob(os.path.join(self.data_dir, _TX_PREFIX + 'm-*.json'))
++        self.assertEqual(len(marker), 1)
++
++        # Startup must deterministically roll back, never treat this as success.
++        ctx.recover_config_transaction(self.data_dir)
++
++        watch_disk = self._read('watch.json')
++        restock_disk = self._read('restock_diff.json')
++        self.assertEqual(watch_disk['title'], 'Generation one')
++        self.assertEqual(watch_disk[WATCH_CONFIG_VERSION_KEY], 1)
++        self.assertEqual(restock_disk['restock_diff']['in_stock_processing'], 'in_stock_only')
++        self.assertEqual(restock_disk[PROCESSOR_CONFIG_VERSION_KEY], 1)
++        self.assertEqual(self._debris(), [])
++
++    def test_failure_rolls_back_live_in_memory_object_too(self):
++        real_replace = os.replace
++        calls = {'n': 0}
++
++        def fail_once_on_watch_final(src, dst):
++            # Fail exactly at the watch.json PUBLISH rename; the best-effort
++            # rollback renames (which run after that point) must still work.
++            if os.path.basename(str(dst)) == 'watch.json':
++                calls['n'] += 1
++                if calls['n'] == 1:
++                    raise OSError("simulated failure")
++            return real_replace(src, dst)
++
++        with mock.patch('changedetectionio.store.config_transaction.os.replace',
++                        side_effect=fail_once_on_watch_final):
++            with self.assertRaises(ConfigPublishError):
++                self.store.publish_watch_update(
++                    self.uuid,
++                    watch_updates={'title': 'DO NOT KEEP'},
++                    processor_config={'restock_diff': {'in_stock_processing': 'off'}},
++                )
++
++        # The in-process immediate rollback restored memory as well - worker keeps
++        # running the old complete configuration (read through the store, since
++        # rollback replaces the live object).
++        live = self.store.data['watching'][self.uuid]
++        self.assertEqual(live['title'], 'Original')
++        self.assertEqual(live[WATCH_CONFIG_VERSION_KEY], 0)
++        self.assertEqual(self._read('watch.json')['title'], 'Original')
++        self.assertEqual(self._debris(), [])
++
++
++class TestStartupRecovery(unittest.TestCase):
++
++    def setUp(self):
++        self.dir = tempfile.mkdtemp()
++        os.makedirs(os.path.join(self.dir, 'watch-uuid'), exist_ok=True)
++        self.data_dir = os.path.join(self.dir, 'watch-uuid')
++
++    def _write(self, name, payload):
++        with open(os.path.join(self.data_dir, name), 'w', encoding='utf-8') as f:
++            json.dump(payload, f)
++
++    def test_committed_marker_completes_the_publish(self):
++        generation = 9
++        # Old finals
++        self._write('watch.json', {'title': 'old', WATCH_CONFIG_VERSION_KEY: generation - 1})
++        self._write('restock_diff.json',
++                    {'restock_diff': {'in_stock_processing': 'in_stock_only'},
++                     PROCESSOR_CONFIG_VERSION_KEY: generation - 1})
++        # Candidates that never got renamed (watch part missing its replace)
++        cand_watch = os.path.basename(
++            ctx._write_candidate(self.data_dir, 0, generation,
++                                ctx._dumps({'title': 'new', WATCH_CONFIG_VERSION_KEY: generation})))
++        cand_proc = os.path.basename(
++            ctx._write_candidate(self.data_dir, 1, generation,
++                                ctx._dumps({'restock_diff': {'in_stock_processing': 'all_changes'},
++                                           PROCESSOR_CONFIG_VERSION_KEY: generation})))
++        marker = {
++            'generation': generation,
++            'state': ctx.STATE_COMMITTED,
++            'parts': [
++                {'final': 'watch.json', 'candidate': cand_watch, 'backup': None,
++                 'version_key': WATCH_CONFIG_VERSION_KEY},
++                {'final': 'restock_diff.json', 'candidate': cand_proc, 'backup': None,
++                 'version_key': PROCESSOR_CONFIG_VERSION_KEY},
++            ],
++        }
++        marker_path = os.path.join(self.data_dir,
++                                  _MARKER_TEMPLATE.format(generation=generation))
++        with open(marker_path, 'w', encoding='utf-8') as f:
++            json.dump(marker, f)
++
++        ctx.recover_config_transaction(self.data_dir)
++
++        with open(os.path.join(self.data_dir, 'watch.json'), 'r', encoding='utf-8') as f:
++            self.assertEqual(json.load(f)['title'], 'new')
++        with open(os.path.join(self.data_dir, 'restock_diff.json'), 'r', encoding='utf-8') as f:
++            self.assertEqual(json.load(f)['restock_diff']['in_stock_processing'], 'all_changes')
++        self.assertEqual([n for n in os.listdir(self.data_dir) if n.startswith(_TX_PREFIX)], [])
++
++    def test_stray_candidates_without_marker_are_swept(self):
++        stray = os.path.join(self.data_dir,
++                            _CANDIDATE_TEMPLATE.format(index=0, generation=3))
++        with open(stray, 'w', encoding='utf-8') as f:
++            f.write('partial')
++        self._write('watch.json', {'title': 'untouched'})
++
++        ctx.recover_config_transaction(self.data_dir)
++
++        self.assertFalse(os.path.exists(stray))
++        with open(os.path.join(self.data_dir, 'watch.json'), 'r', encoding='utf-8') as f:
++            self.assertEqual(json.load(f)['title'], 'untouched')
++
++
++class TestReadFencing(JointPublishTestBase):
++
++    def test_reader_gets_previous_generation_while_prepared(self):
++        # Existing complete generation
++        self.store.publish_watch_update(
++            self.uuid,
++            watch_updates={'title': 'old title'},
++            processor_config={'restock_diff': {'in_stock_processing': 'in_stock_only'}},
++        )
++
++        # Hand-craft a PREPARED marker pointing to a new candidate + old backup
++        generation = 2
++
++        import shutil
++        proc_final = os.path.join(self.data_dir, 'restock_diff.json')
++        proc_backup = os.path.join(self.data_dir, '.cfgtx-b-1-2')
++        shutil.copyfile(proc_final, proc_backup)
++        cand = os.path.basename(ctx._write_candidate(
++            self.data_dir, 1, generation,
++            ctx._dumps({'restock_diff': {'in_stock_processing': 'off'},
++                       PROCESSOR_CONFIG_VERSION_KEY: generation})))
++        marker = {'generation': generation, 'state': ctx.STATE_PREPARED,
++                  'parts': [{'final': 'restock_diff.json', 'candidate': cand,
++                             'backup': os.path.basename(proc_backup),
++                             'version_key': PROCESSOR_CONFIG_VERSION_KEY}]}
++        with open(os.path.join(self.data_dir, _MARKER_TEMPLATE.format(generation=generation)),
++                  'w', encoding='utf-8') as f:
++            json.dump(marker, f)
++
++        # Readers see the backup (old complete generation), not the candidate
++        seen = self.store.read_watch_processor_config(self.uuid, 'restock_diff.json')
++        self.assertEqual(seen['restock_diff']['in_stock_processing'], 'in_stock_only')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/docs/api-spec.yaml b/docs/api-spec.yaml
+index 238ab47e..f0afb1ea 100644
+--- a/docs/api-spec.yaml
++++ b/docs/api-spec.yaml
+@@ -284,6 +284,16 @@ components:
+           format: uuid
+           description: Unique identifier
+           readOnly: true
++        config_version:
++          type: integer
++          minimum: 0
++          description: |
++            Monotonic generation of the watch's jointly-published configuration
++            (`watch.json` plus the current processor's settings). Returned on GET.
++            Send the value read from GET back in the `If-Match` header on PUT to
++            make sure a concurrent newer save cannot be overwritten; a stale
++            value yields HTTP 409.
++          readOnly: true
+         date_created:
+           type: [integer, 'null']
+           description: Unix timestamp of creation
+@@ -1190,6 +1200,17 @@ paths:
+           schema:
+             type: string
+             format: uuid
++        - name: If-Match
++          in: header
++          required: false
++          description: |
++            Optimistic-concurrency token: the `config_version` returned by GET.
++            When it no longer matches the watch's current generation because a
++            concurrent save won, the PUT fails with `409` instead of overwriting
++            the newer configuration. `*` (or omitted) skips the check.
++          schema:
++            type: string
++          example: '"3"'
+       requestBody:
+         required: true
+         content:
+@@ -1204,8 +1225,14 @@ paths:
+               schema:
+                 type: string
+                 example: "OK"
++        '409':
++          description: The watch configuration changed since the request was based on it (stale `If-Match`/`config_version`); reload and retry
++          content:
++            text/plain:
++              schema:
++                type: string
+         '500':
+-          description: Server error
++          description: Server error (joint configuration publication failed; the previous configuration remains active)
+ 
+     delete:
+       operationId: deleteWatch
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 00000000..77ef37c3
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,8 @@
++dgtlmoon-changedetection.io-47ff31f1-9d29-4da7-915c-8064fa239931
++Rubric ID：1｜状态：通过｜期望行为：普通处理器、首次创建、tag override 和处理器切换语义不回归。｜实际观察：无处理器配置只写 watch.json，切换保存独立文件，首次创建失败删除半成品；相关事务和入口测试通过。｜直接证据：test_watch_joint_publish.py:86-150；api/Watch.py:601-618；Ran 12 tests、OK。
++Rubric ID：2｜状态：未通过｜期望行为：UI 任一步失败不显示成功、不排检查且旧主配置和旧处理器配置共同生效。｜实际观察：UI 在 publish_watch_update 前直接修改 live watch；强制 joint_publish 失败后内存 title 为 ui-new、磁盘 title 为 old。｜直接证据：P3_UI_FAILURE_MEMORY_DISK ui-new old。｜原因：编辑页在进入共同发布前已修改 live watch，发布失败时恢复快照也是新值，内存继续使用新主配置而磁盘保持旧配置｜影响：失败请求虽不排立即检查，但现有 worker 可继续读取未持久化的新主配置。｜证据位置：blueprint/ui/edit.py:269-290；store/__init__.py:626-721。
++Rubric ID：3｜状态：通过｜期望行为：API PUT 失败返回非成功，GET 与重启保持旧完整代际。｜实际观察：API 入口捕获发布异常返回 500，版本冲突返回 409；失败入口测试通过且旧磁盘配置和队列保持不变。｜直接证据：api/Watch.py:264-295；test_joint_publish_entrypoints.py:101-137；入口 pytest 三项通过。
++Rubric ID：4｜状态：未通过｜期望行为：两文件发布间中断时 worker、edit 和 GET 不读取混合代际。｜实际观察：在处理器 candidate 已替换且 marker 仍 prepared 的受控窗口，live watch title 为 live-new，read_watch_processor_config 返回旧 threshold。｜直接证据：P3_INFLIGHT_READER_MIX live-new old；prepared 恢复最终回滚为 old/old。｜原因：prepared 发布窗口内 live watch 已是新主配置，事务感知处理器读取返回旧备份，worker 与读取入口可观察混合代际｜影响：发布进行中 worker 可用新主配置配旧处理器设置执行检查。｜证据位置：store/__init__.py:641-711；config_transaction.py:395-407、431-463。
++Rubric ID：5｜状态：未通过｜期望行为：成功保存后所有读取入口只观察同一已提交代际。｜实际观察：发布线程暂停时 save 尚未返回，live watch 已为新值而处理器事务读取返回旧值，证明共同发布对运行中读者不是原子可见。｜直接证据：P3_INFLIGHT_READER_MIX live-new old、P3_SAVE_OUTCOME ['ok']。｜原因：成功发布完成前内存 watch 已更新为新配置，而处理器读取仍返回旧代际，读取入口没有共同可见性屏障｜影响：检查 worker 能在成功请求完成前读取混合配置并产生错误检查结果。｜证据位置：store/__init__.py:641-711；processors/base.py:334-363。
++Rubric ID：6｜状态：通过｜期望行为：处理器 JSON 写入中断不截断有效配置，临时清理不删除已提交设置。｜实际观察：候选写入后使用 os.replace，prepared 回滚和 committed 恢复测试均通过，清理仅针对 .cfgtx 文件。｜直接证据：config_transaction.py:141-161、212-291、343-424；test_watch_joint_publish.py 的故障与恢复用例通过。
++Rubric ID：7｜状态：未通过｜期望行为：并发 UI/API 更新按确定顺序，迟到请求不得覆盖较新代际。｜实际观察：API If-Match 未提供时 expected_version 为 None；较新成功后再提交无 If-Match 的迟到更新，最终 title 为 late-no-if-match、config_version 增加。｜直接证据：P3_NO_IF_MATCH_OVERWRITE late-no-if-match 5。｜原因：API PUT 的 If-Match 是可选项，未携带版本的迟到请求会以 expected_version None 覆盖较新的成功配置｜影响：旧客户端或迟到请求能够覆盖较新的成功配置。｜证据位置：api/Watch.py:264-287；store/__init__.py:647-657。
+diff --git a/evidence/screenshots/01-rubric-comparison.png b/evidence/screenshots/01-rubric-comparison.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..05b9a814d36d000836345bfaebbb99a3f8950fc9
+GIT binary patch
+literal 51175
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 00000000..c5c134f8
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,22 @@
++rubrics:
++- id: 1
++  type: p2p
++  text: 普通 text processor、没有专用配置、首次创建、tag override 以及切换处理器再切回时保存各自设置的现有语义不回归。
++- id: 2
++  type: f2p
++  text: UI 保存中 processor JSON 或 Watch 持久化任一步失败时不显示成功、不排立即检查，旧主配置和旧处理器配置继续共同生效。
++- id: 3
++  type: f2p
++  text: API PUT 任一部分失败返回非成功响应，GET API 仍展示旧完整配置，服务重启也加载旧成功代际。
++- id: 4
++  type: f2p
++  text: 进程在两个文件写入或共同发布之间中断时，worker 与 edit/GET 不读取混合代际，启动能够确定回滚或完成且最终清理候选资源。
++- id: 5
++  type: f2p
++  text: 成功保存后 watch.json、当前 processor JSON、UI 回显、GET API、worker 检查和重启加载观察同一已提交配置代际。
++- id: 6
++  type: f2p
++  text: processor JSON 写入被中断不会截断当前有效配置或触发静默默认值；临时文件的失败清理不会删除已提交设置。
++- id: 7
++  type: f2p
++  text: 并发 UI/API 更新按确定顺序发布，迟到成功或失败不能覆盖较新代际、排错配置的检查或留下永久半提交。
